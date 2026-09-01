@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/are-core",
+    "crates/are-client",
+    "crates/are-daemon",
+    "crates/are-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/are-project/are"
+description = "Agent Remote Environment"
+
+[workspace.dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+are-core = { path = "crates/are-core" }
+are-client = { path = "crates/are-client" }
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

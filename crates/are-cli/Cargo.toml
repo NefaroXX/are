@@ -1,0 +1,20 @@
+[package]
+name = "are-cli"
+description = "ARE CLI (are) — environment management, connection testing, diagnostics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "are"
+path = "src/main.rs"
+
+[dependencies]
+are-core.workspace = true
+are-client.workspace = true
+clap = { version = "4", features = ["derive"] }
+
+[lints]
+workspace = true

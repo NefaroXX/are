@@ -1,0 +1,241 @@
+# ARE Architecture
+
+**Gate 0 — 2026-09-01**
+
+---
+
+## Overview
+
+Agent Remote Environment (ARE) provides a secure, agent-oriented abstraction for operating on remote Linux machines. The fundamental guarantee: once an agent is bound to an environment, every operation unambiguously occurs on the remote machine. There is no local fallback.
+
+---
+
+## Component Responsibilities
+
+### `are-core`
+
+Domain models, identifiers, and types shared by all other crates.
+
+Contains:
+
+- `EnvironmentId`, `SessionId`, `ProcessId`
+- Request types, response types, error types
+- Capability models
+
+**Constraints (non-negotiable):**
+
+```
+NO networking
+NO filesystem access
+NO process execution
+NO TLS implementation
+```
+
+`are-core` is a pure data/types crate. It depends on no other workspace crate and introduces no I/O.
+
+### `are-client`
+
+Remote environment client. Provides the transport-agnostic client API that agents and adapters call.
+
+Contains:
+
+- Transport abstraction (connection lifecycle)
+- Session client logic
+- Environment API surface
+
+**Constraints:**
+
+```
+MUST NOT execute local shell commands
+MUST NOT perform implicit local filesystem access
+```
+
+The client sends requests over the transport and receives responses. It never silently executes operations on the local machine.
+
+### `are-daemon` (`ared`)
+
+The remote daemon. Runs on the target Linux machine and is the trust anchor for that environment.
+
+Contains:
+
+- Request handling (inbound RPC/service)
+- Authentication and authorization
+- Session manager
+- Process backend
+- Filesystem backend
+
+The daemon is the only component that touches the remote machine's OS. It enforces all security policy.
+
+### `are-cli` (`are`)
+
+The command-line interface for human operators.
+
+Contains:
+
+- Environment management commands
+- Connection testing
+- Daemon interaction
+- Diagnostics
+
+The CLI depends on `are-core` and `are-client`. It does not contain business logic — it delegates to the client.
+
+---
+
+## Trust Boundaries
+
+### Agent vs. Client vs. Daemon
+
+```
+┌─────────────────────────────────────────────────┐
+│  Agent / Adapter (untrusted — runs on user      │
+│  machine, may be compromised)                   │
+│                                                 │
+│  Trust: none. Every operation must be explicitly│
+│  authorized by the daemon.                      │
+└──────────────────────┬──────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────┐
+│  ARE Client (untrusted — runs on user machine,  │
+│  transports requests to daemon)                 │
+│                                                 │
+│  Trust: none. No local fallback. No ambient     │
+│  authority.                                     │
+└──────────────────────┬──────────────────────────┘
+                       │
+                       │ TLS / mTLS
+                       │ (transport boundary)
+                       ▼
+┌─────────────────────────────────────────────────┐
+│  ared — Daemon (trust anchor on remote machine) │
+│                                                 │
+│  Trust: this component IS the security policy.  │
+│  It authenticates the client, authorizes each   │
+│  request, and enforces environment boundaries.  │
+└──────────────────────┬──────────────────────────┘
+                       │
+                       ▼
+               Remote Linux Machine
+         (authoritative environment — no
+          operations occur elsewhere)
+```
+
+### Transport Boundary
+
+The boundary between client and daemon is TLS/mTLS. All data in transit is encrypted and mutually authenticated. No plaintext protocol exists.
+
+### Environment Boundary
+
+Each environment has a defined set of allowed roots (filesystem paths, capabilities). The daemon enforces these per-request. Compromising one environment does not grant access to another.
+
+---
+
+## Data Flow
+
+```
+Agent
+  │
+  │ (adapter calls environment API)
+  ▼
+ARE Client
+  │
+  │ (serializes request, sends over TLS)
+  │
+  ├──────── TLS / mTLS ─────────┐
+  │                              │
+  ▼                              ▼
+┌──────────────────────────────────────┐
+│  ared (daemon on remote Linux box)   │
+│                                      │
+│  1. Authenticate client (mTLS cert)  │
+│  2. Authorize request (capabilities) │
+│  3. Validate path / operation        │
+│  4. Execute on remote OS             │
+│  5. Return result                    │
+└──────────────────────────────────────┘
+  │
+  ▼
+Remote Linux Machine (authoritative)
+```
+
+**Key invariant:** The remote machine is authoritative. The client never falls back to local execution. If the remote is unreachable, the operation fails — it does not silently succeed locally.
+
+---
+
+## Crate Dependency Graph
+
+```
+are-cli (binary: are)
+  ├── are-core
+  └── are-client
+        └── are-core
+
+are-daemon (binary: ared)
+  └── are-core
+```
+
+- `are-core` has zero workspace dependencies — standalone.
+- `are-client` depends only on `are-core`.
+- `are-daemon` depends only on `are-core` (does not depend on `are-client`).
+- `are-cli` depends on both `are-core` and `are-client`.
+
+This ensures `are-core` can be used independently by any future component (e.g., a relay in Gate 11, or an agent integration in Gate 9) without pulling in client or daemon logic.
+
+---
+
+## Workspace Layout
+
+```
+are/
+├── Cargo.toml              (workspace root)
+├── crates/
+│   ├── are-core/           (domain models, no I/O)
+│   ├── are-client/         (transport client, no local exec)
+│   ├── are-daemon/         (remote daemon, trust anchor)
+│   └── are-cli/            (CLI frontend)
+├── docs/
+│   ├── architecture.md     (this file)
+│   ├── threat-model.md     (threat model)
+│   └── decisions/          (ADR directory)
+└── tests/                  (integration tests)
+```
+
+---
+
+## Gate Reference
+
+This architecture is the foundation (Gate 0). Future gates add capability incrementally:
+
+| Gate | Scope | Status |
+|------|-------|--------|
+| 0 | Repository and architecture foundation | **Current** |
+| 1 | Environment domain model | Pending |
+| 2 | Security model and identity design | Pending |
+| 3 | Minimal secure connection (TLS/mTLS) | Pending |
+| 4 | Read-only filesystem access | Pending |
+| 5 | Process execution (structured, no shell) | Pending |
+| 6 | Persistent agent sessions | Pending |
+| 7 | Filesystem write operations | Pending |
+| 8 | Capability-based authorization | Pending |
+| 9 | Agent integration prototype | Pending |
+| 10 | CLI and SSH-level usability | Pending |
+| 11 | Reverse connection architecture | Pending |
+| 12 | Service management | Pending |
+| 13 | Package management | Pending |
+| 14 | Protocol stabilization review | Pending |
+
+**STOP gates** exist after every gate. No gate is started until the previous gate's deliverables are reviewed and approved.
+
+**Gate 0 is foundation only.** No networking implementation exists yet. No transport, no TLS, no remote communication. The crates contain only domain types and scaffold.
+
+---
+
+## Design Rules (Summary)
+
+1. **No custom cryptography.** Use audited libraries and OS primitives.
+2. **Environment identity is explicit.** Every operation names its environment; never inferred from local working directory.
+3. **No local fallback.** If bound to a remote environment, all operations occur remotely.
+4. **Security before convenience.** No arbitrary remote execution without authentication and authorization.
+5. **No premature protocol standardisation.** The protocol emerges from real usage (Gate 14).
+
+See `PLAN.md` Sections 5 and 8 for full design rules and security principles.

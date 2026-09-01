@@ -1,10 +1,10 @@
 # ARE — Agent Remote Environment
 
-> **Status: Pre-Gate 0 — private, early scaffold. Do not use.**
+> **Status: Gate 0 complete — foundation scaffold, docs, and CI. STOP for review before Gate 1. Do not use.**
 
 ARE is a secure, agent-oriented remote environment system that lets AI coding agents operate on remote Linux machines as if those machines are their primary execution environment.
 
-This repo is currently **private** while Gate 0 foundation is prepared. See `PLAN.md` for the full 14-gate plan (Gates 0–14, strict STOP gates).
+This repo is currently **private** while the gated implementation proceeds. See `PLAN.md` for the full 14-gate plan (Gates 0–14, strict STOP gates). Gate 0 deliverables (workspace, crate boundaries, architecture, threat model, CI) are complete and awaiting STOP review.
 
 ## Working Names
 
@@ -49,7 +49,7 @@ Targets: LXC containers, VMs, remote Linux servers (Debian/Ubuntu/Proxmox LXC), 
 
 ## Next Step
 
-Gate 0 deliverables (not yet implemented):
+Gate 0 deliverables (complete, STOP gate):
 
 ```
 are/
@@ -59,7 +59,9 @@ are/
 └── tests/
 ```
 
-CI: fmt + clippy -D warnings + tests
+CI: fmt + clippy -D warnings + tests — `.github/workflows/ci.yml`
+
+**STOP — do not start Gate 1 without explicit approval.** See `PLAN.md` §6 and STOP after Gate 0.
 
 ---
 
