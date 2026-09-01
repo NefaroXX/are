@@ -1,0 +1,24 @@
+# Rust
+/target/
+**/target/
+Cargo.lock
+# but keep Cargo.lock for binaries? workspace - ignoring for now per Rust lib convention
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+# Env / secrets
+.env
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+# OS
+Desktop.ini
+# Logs
+*.log
