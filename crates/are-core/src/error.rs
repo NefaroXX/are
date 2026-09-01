@@ -28,4 +28,8 @@ pub enum CoreError {
     /// A required capability is not granted.
     #[error("missing required capability: {0:?}")]
     MissingCapability(Capability),
+
+    /// An identity or credential failed validation.
+    #[error("invalid identity: {0}")]
+    InvalidIdentity(String),
 }

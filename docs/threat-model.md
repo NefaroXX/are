@@ -1,6 +1,6 @@
 # ARE Threat Model
 
-**Gate 0 — 2026-09-01**
+**Gate 2 — 2026-09-01**
 
 ---
 
@@ -203,11 +203,76 @@ This is the initial threat model, authored at Gate 0. **No networking implementa
 
 5. **TLS implementations are correct.** We rely on established Rust TLS libraries (rustls or similar) rather than implementing custom cryptography.
 
+6. **Machine identities are per-machine, not per-environment.** One machine identity serves all environments on that machine. Environment-level authorization is via capabilities, not separate identities. (Added Gate 2)
+
+7. **Enrollment credentials are bootstrap-only.** They never become permanent machine credentials. After enrollment, the daemon possesses its own keypair and certificate. (Added Gate 2)
+
+---
+
+## Gate 2 Threat Update
+
+**Date:** 2026-09-01  
+**Scope:** Identity architecture design. No crypto enforcement yet.
+
+### Network Attacker (TLS)
+
+| Aspect | Gate 0 | Gate 2 | Gate 3 (enforcement) |
+|--------|--------|--------|---------------------|
+| Traffic encryption | Not mitigated | Trust anchor model defined | TLS 1.3 encrypts all traffic |
+| Traffic integrity | Not mitigated | mTLS designed | mTLS provides integrity |
+| Replay protection | Not mitigated | Request nonces designed | TLS session resumption + nonces |
+
+**Gate 2 contribution:** Defines trust anchor types (`SelfSigned` for dev, `CaSigned` for prod) and certificate format (X.509 PEM). Establishes that no plaintext protocol will ever exist.
+
+### Machine Impersonation (mTLS)
+
+| Aspect | Gate 0 | Gate 2 | Gate 3 (enforcement) |
+|--------|--------|--------|---------------------|
+| Daemon impersonation | Not mitigated | Client validates daemon cert (designed) | mTLS handshake enforces |
+| Client impersonation | Not mitigated | Daemon validates client cert (designed) | mTLS handshake enforces |
+| Enrollment token theft | Not designed | Single-use + short-lived (<1h) + revocable | Token consumed on first use |
+| Stolen machine key | Not designed | Revocation + re-enrollment procedure | CRL / invalidation endpoint |
+
+**Gate 2 contribution:** Enrollment credential design limits impersonation window to <1 hour with single use. Revocation matrix documented with detection → action → recovery for all four scenarios.
+
+### Malicious Agent (Capability Auth)
+
+| Aspect | Gate 0 | Gate 2 | Gate 8 (enforcement) |
+|--------|--------|--------|---------------------|
+| Exceed authorized ops | Not mitigated | Enrollment scoped to specific capabilities | Per-operation capability check |
+| Cross-environment access | Not mitigated | Enrollment scoped to one environment | Environment isolation enforced |
+| Process escape | Not mitigated | Executable allow/deny lists designed | Gate 5 enforcement |
+
+**Gate 2 contribution:** Enrollment credentials are scoped to exactly one environment and a specific capability set. This scoping principle extends to machine credentials in Gate 8.
+
+### Compromised Client (Revocation/Rotation)
+
+| Aspect | Gate 0 | Gate 2 | Future Gates |
+|--------|--------|--------|-------------|
+| Stolen private key | No response | Revocation terminates sessions + rejects requests | CRL enforcement (Gate 3) |
+| Credential rotation | Not designed | Re-enrollment flow: revoke → new keypair → new cert | Automated rotation (future) |
+| Blast radius | Unbounded | One environment + limited capabilities per credential | Scoped permissions (Gate 8) |
+| Detection | None | Revocation logged with reason (`Compromised`, `Administrative`, etc.) | Audit logging (future) |
+
+**Gate 2 contribution:** Revocation reasons defined (`Compromised`, `Expired`, `Administrative`, `EnvironmentDisabled`). Rotation procedure documented: revoke old → generate new keypair → re-enroll → update config.
+
+### Honest Assessment
+
+Gate 2 designs the identity architecture but **does not enforce it**. Specifically:
+
+- ✅ Identity types defined (`MachineIdentity`, `EnrollmentCredential`, `TrustAnchor`, `RevocationReason`)
+- ✅ Trust model documented (mTLS, enrollment flow, revocation matrix)
+- ✅ Threat model updated with Gate 2 analysis
+- ❌ No TLS enforcement (Gate 3)
+- ❌ No capability enforcement (Gate 8)
+- ❌ No revocation list implementation (Gate 3+)
+- ❌ No enrollment endpoint (Gate 3+)
+
+**The identity design is sound but not yet enforced.** An attacker who ignores the identity layer faces no cryptographic barrier until Gate 3.
+
 ---
 
 ## Out of Scope (Gate 0)
-
-- Custom encryption or key exchange algorithms
 - Windows or macOS support
 - GUI or web dashboard
 - Multi-user collaboration
@@ -223,11 +288,11 @@ These are explicitly excluded from the initial implementation per `PLAN.md` Sect
 
 ---
 
-## Revocation Strategy (Placeholder)
+## Revocation Strategy
 
-Revocation is designed at Gate 2 but not implemented until credentials exist.
+Revocation is designed at Gate 2 (see `docs/identity.md` for full architecture). Implementation of enforcement mechanisms is deferred to Gate 3.
 
-**Planned mechanisms:**
+**Designed mechanisms:**
 
 | Scenario | Response |
 |----------|----------|
@@ -236,31 +301,37 @@ Revocation is designed at Gate 2 but not implemented until credentials exist.
 | Environment disabled | All sessions for that environment terminated. New requests denied. |
 | Session terminated | All processes in session terminated. Working directory state preserved for reconnection (Gate 6). |
 
-**Credential properties (target):**
+**Credential properties (designed, Gate 2):**
 
-- Short-lived enrollment credentials (single use, time-limited)
-- Machine credentials (long-lived but rotatable)
-- No permanent shared secrets
-- Revocation list or credential invalidation endpoint (mechanism TBD at Gate 2)
+- Short-lived enrollment credentials (single use, time-limited, < 1h TTL)
+- Machine credentials (long-lived keypair + certificate, rotatable via re-enrollment)
+- No permanent shared secrets — enrollment tokens never become permanent credentials
+- Revocation reasons: `Compromised`, `Expired`, `Administrative`, `EnvironmentDisabled`
+
+**See:** `docs/identity.md` §4 Revocation for full revocation matrix and rotation procedure.
 
 ---
 
-## Gate 0 Summary
+## Gate Summary
 
-| Threat | Mitigated at Gate 0? | Planned Gate |
-|--------|-----------------------|--------------|
-| Network attacker | No | Gate 3 (TLS/mTLS) |
-| Compromised client | No | Gate 2 (revocation), Gate 8 (capabilities) |
-| Compromised daemon | Design principle only | Operational concern |
-| Compromised controller | Out of scope | Gate 11 |
-| Malicious agent | No | Gate 8 (capabilities) |
-| Credential theft | No | Gate 2 (short-lived creds, rotation) |
-| Replay attacks | No | Gate 3 (TLS) |
-| Privilege escalation | No | Gate 5 (structured exec), Gate 8 (capabilities) |
-| Filesystem escape | No | Gate 4 (path validation) |
-| Process escape | No | Gate 5 (structured exec, allow lists) |
+| Threat | Gate 0 | Gate 2 (design) | Enforcement Gate |
+|--------|--------|-----------------|------------------|
+| Network attacker | No | Trust anchor model, cert format defined | Gate 3 (TLS/mTLS) |
+| Compromised client | No | Revocation matrix, rotation procedure, scoped enrollment | Gate 3 (CRL) + Gate 8 (capabilities) |
+| Compromised daemon | Design principle only | Revocation + re-enrollment documented | Operational concern |
+| Compromised controller | Out of scope | — | Gate 11 |
+| Malicious agent | No | Enrollment scoped to one environment + capabilities | Gate 8 (capabilities) |
+| Credential theft | No | Single-use short-lived tokens, revocation reasons defined | Gate 3 (CRL) |
+| Replay attacks | No | Request nonces designed | Gate 3 (TLS) |
+| Privilege escalation | No | — | Gate 5 (structured exec), Gate 8 (capabilities) |
+| Filesystem escape | No | — | Gate 4 (path validation) |
+| Process escape | No | — | Gate 5 (structured exec, allow lists) |
 
-**Honest assessment:** Gate 0 provides no runtime security. It establishes the architectural boundaries and documents the threat landscape so that subsequent gates implement mitigations with clear targets. The architecture ensures security is layered in, not bolted on.
+**Gate 0:** Architectural boundaries and threat landscape documented. No runtime security.
+
+**Gate 2:** Identity architecture designed. Types implemented in `are-core`. Trust model, enrollment flow, and revocation matrix documented. **No cryptographic enforcement yet.**
+
+**Honest assessment:** Gate 2 provides design-level identity architecture. The types are implemented and tested, but no crypto libraries are added and no mTLS enforcement exists. An attacker who ignores the identity layer faces no cryptographic barrier until Gate 3.
 
 ---
 

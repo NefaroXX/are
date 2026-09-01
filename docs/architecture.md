@@ -1,6 +1,6 @@
 # ARE Architecture
 
-**Gate 0 — 2026-09-01**
+**Gate 2 — 2026-09-01**
 
 ---
 
@@ -130,6 +130,52 @@ Each environment has a defined set of allowed roots (filesystem paths, capabilit
 
 ---
 
+## Security / Identity (Gate 2)
+
+**Design document:** `docs/identity.md`
+
+### Machine Identity
+
+Every daemon and client possesses a machine identity consisting of a keypair, an X.509 certificate, and a stable machine identifier. Private keys never leave the host and are never serialized. Public-facing identity is expressed as:
+
+```
+MachineIdentity {
+    id: "dev-vm",
+    public_key_fingerprint: "sha256:<64 hex>",
+    certificate_pem: "-----BEGIN CERTIFICATE-----..."
+}
+```
+
+### Trust Model
+
+- **Client ↔ Daemon:** Mutual TLS 1.3 (mTLS). Both sides present certificates and validate the peer.
+- **Trust anchors:** `SelfSigned` (development only) or `CaSigned` (production).
+- **No permanent shared secrets.** Every credential is revocable and time-limited.
+
+### Enrollment
+
+One-time enrollment credentials bootstrap new daemons. Properties: short-lived (< 1h), single-use, revocable, scoped to one environment + capability set. Enrollment credentials **never** become permanent machine credentials.
+
+### Revocation
+
+Four revocation scenarios with documented detection → action → recovery:
+
+| Scenario | Action |
+|----------|--------|
+| Client credential revoked | Reject requests, terminate sessions |
+| Daemon credential revoked | Deny connections, invalidate sessions |
+| Environment disabled | Terminate all sessions, deny new requests |
+| Session terminated | Terminate processes, preserve state |
+
+**See:** `docs/identity.md` §4 for full revocation matrix.
+
+### Constraints
+
+- **No crypto in `are-core`.** Identity types are pure data shapes. Cryptographic enforcement (rustls, rcgen) arrives in Gate 3.
+- **No custom cryptography.** Established libraries only (rustls, webpki, rcgen).
+
+---
+
 ## Data Flow
 
 ```
@@ -208,9 +254,9 @@ This architecture is the foundation (Gate 0). Future gates add capability increm
 
 | Gate | Scope | Status |
 |------|-------|--------|
-| 0 | Repository and architecture foundation | **Current** |
-| 1 | Environment domain model | Pending |
-| 2 | Security model and identity design | Pending |
+| 0 | Repository and architecture foundation | ✓ Complete |
+| 1 | Environment domain model | ✓ Complete |
+| 2 | Security model and identity design | ✓ Complete |
 | 3 | Minimal secure connection (TLS/mTLS) | Pending |
 | 4 | Read-only filesystem access | Pending |
 | 5 | Process execution (structured, no shell) | Pending |

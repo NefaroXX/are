@@ -1,10 +1,10 @@
 # ARE — Agent Remote Environment
 
-> **Status: Gate 1 complete — environment domain model (transport-independent). STOP for review before Gate 2. Do not use.**
+> **Status: Gate 2 complete — identity architecture design. STOP for review before Gate 3. Do not use.**
 
 ARE is a secure, agent-oriented remote environment system that lets AI coding agents operate on remote Linux machines as if those machines are their primary execution environment.
 
-This repo is currently **private** while the gated implementation proceeds. See `PLAN.md` for the full 14-gate plan (Gates 0–14, strict STOP gates). Gates 0–1 are complete and awaiting STOP review.
+This repo is currently **private** while the gated implementation proceeds. See `PLAN.md` for the full 14-gate plan (Gates 0–14, strict STOP gates). Gates 0–2 are complete and awaiting STOP review.
 
 ## Working Names
 
@@ -23,8 +23,8 @@ Targets: LXC containers, VMs, remote Linux servers (Debian/Ubuntu/Proxmox LXC), 
 ## Gates (summary)
 
 0. Repository & Architecture Foundation ✓ complete
-1. Environment Domain Model ← **we are here** ✓ complete (transport-independent trait)
-2. Security Model & Identity
+1. Environment Domain Model ✓ complete (transport-independent trait)
+2. Security Model & Identity ← **we are here** ✓ complete (design + types, no crypto enforcement yet)
 3. Minimal Secure Connection (TLS 1.3 + HTTP/2, mTLS, `GetEnvironmentInfo`)
 4. Read-Only Filesystem
 5. Process Execution (structured, no shell)
@@ -49,20 +49,21 @@ Targets: LXC containers, VMs, remote Linux servers (Debian/Ubuntu/Proxmox LXC), 
 
 ## Next Step
 
-Gates 0–1 deliverables (complete, STOP gate):
+Gates 0–2 deliverables (complete, STOP gate):
 
 ```
 are/
 ├── Cargo.toml (workspace)
-├── crates/are-core (EnvironmentId/SessionId/ProcessId, Platform, CapabilitySet, Environment, Request/Response, Environment trait)
-├── crates/{are-client,are-daemon,are-cli} (stubs, no networking)
-├── docs/{architecture.md,threat-model.md,decisions/}
+├── crates/are-core (Identity, EnrollmentCredential, TrustAnchor, RevocationReason + 70 domain tests)
+├── docs/{architecture.md,threat-model.md,identity.md,decisions/}
 └── tests/
 ```
 
+Gate 2 added: identity types, enrollment design, revocation matrix, threat model update, identity architecture doc. No crypto deps yet — Gate 3 adds rustls/rcgen.
+
 CI: fmt + clippy -D warnings + tests — `.github/workflows/ci.yml`
 
-**STOP — do not start Gate 2 without explicit approval.** See `PLAN.md` §6 and STOP after Gate 1.
+**STOP — do not start Gate 3 without explicit approval.** See `PLAN.md` §6 and STOP after Gate 2.
 
 ---
 

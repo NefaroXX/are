@@ -19,6 +19,7 @@
 mod capability;
 mod environment;
 mod error;
+mod identity;
 mod ids;
 mod platform;
 mod request;
@@ -27,6 +28,9 @@ mod traits;
 pub use capability::{Capability, CapabilitySet};
 pub use environment::{Environment, EnvironmentMetadata};
 pub use error::CoreError;
+pub use identity::{
+    EnrollmentCredential, MachineIdentity, RevocationReason, TrustAnchor, ENROLLMENT_MAX_TTL_SECS,
+};
 pub use ids::{EnvironmentId, ProcessId, SessionId};
 pub use platform::Platform;
 pub use request::*;
