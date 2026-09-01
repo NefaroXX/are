@@ -1,10 +1,10 @@
 # ARE — Agent Remote Environment
 
-> **Status: Gate 2 complete — identity architecture design. STOP for review before Gate 3. Do not use.**
+> **Status: Gate 3 complete — minimal secure connection (TLS 1.3 mTLS + GetEnvironmentInfo). STOP for review before Gate 4. Do not use.**
 
 ARE is a secure, agent-oriented remote environment system that lets AI coding agents operate on remote Linux machines as if those machines are their primary execution environment.
 
-This repo is currently **private** while the gated implementation proceeds. See `PLAN.md` for the full 14-gate plan (Gates 0–14, strict STOP gates). Gates 0–2 are complete and awaiting STOP review.
+This repo is currently **private** while the gated implementation proceeds. See `PLAN.md` for the full 14-gate plan (Gates 0–14, strict STOP gates). Gates 0–3 are complete and awaiting STOP review.
 
 ## Working Names
 
@@ -24,8 +24,8 @@ Targets: LXC containers, VMs, remote Linux servers (Debian/Ubuntu/Proxmox LXC), 
 
 0. Repository & Architecture Foundation ✓ complete
 1. Environment Domain Model ✓ complete (transport-independent trait)
-2. Security Model & Identity ← **we are here** ✓ complete (design + types, no crypto enforcement yet)
-3. Minimal Secure Connection (TLS 1.3 + HTTP/2, mTLS, `GetEnvironmentInfo`)
+2. Security Model & Identity ✓ complete (design + types, mTLS design)
+3. Minimal Secure Connection ← **we are here** ✓ complete (TLS 1.3 mTLS + GetEnvironmentInfo over length-prefixed JSON)
 4. Read-Only Filesystem
 5. Process Execution (structured, no shell)
 6. Persistent Agent Sessions
@@ -49,21 +49,24 @@ Targets: LXC containers, VMs, remote Linux servers (Debian/Ubuntu/Proxmox LXC), 
 
 ## Next Step
 
-Gates 0–2 deliverables (complete, STOP gate):
+Gates 0–3 deliverables (complete, STOP gate):
 
 ```
 are/
-├── Cargo.toml (workspace)
-├── crates/are-core (Identity, EnrollmentCredential, TrustAnchor, RevocationReason + 70 domain tests)
+├── Cargo.toml (workspace with tokio + rustls 0.23 + tokio-rustls + rcgen)
+├── crates/are-core (info.rs GetEnvironmentInfo + Rpc envelope + 76 tests)
+├── crates/are-daemon (tls.rs + server.rs + framing.rs + handler.rs + 13 tests)
+├── crates/are-client (tls.rs + connection.rs + framing.rs + SecureClient)
+├── crates/are-cli (are connect + are doctor)
 ├── docs/{architecture.md,threat-model.md,identity.md,decisions/}
 └── tests/
 ```
 
-Gate 2 added: identity types, enrollment design, revocation matrix, threat model update, identity architecture doc. No crypto deps yet — Gate 3 adds rustls/rcgen.
+Gate 3 added: TLS 1.3 mTLS (rustls), length-prefixed JSON framing (16 MiB limit), GetEnvironmentInfo RPC, ared listen + are connect/doctor, 6 security integration tests (5 failure modes must fail closed).
 
-CI: fmt + clippy -D warnings + tests — `.github/workflows/ci.yml`
+CI: fmt + clippy -D warnings + tests (96 tests total) — `.github/workflows/ci.yml`
 
-**STOP — do not start Gate 3 without explicit approval.** See `PLAN.md` §6 and STOP after Gate 2.
+**STOP — do not start Gate 4 without explicit approval.** See `PLAN.md` §6 and STOP after Gate 3.
 
 ---
 

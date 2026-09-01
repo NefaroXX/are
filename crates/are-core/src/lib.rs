@@ -21,6 +21,7 @@ mod environment;
 mod error;
 mod identity;
 mod ids;
+mod info;
 mod platform;
 mod request;
 mod traits;
@@ -32,6 +33,10 @@ pub use identity::{
     EnrollmentCredential, MachineIdentity, RevocationReason, TrustAnchor, ENROLLMENT_MAX_TTL_SECS,
 };
 pub use ids::{EnvironmentId, ProcessId, SessionId};
+pub use info::{
+    GetEnvironmentInfoRequest, GetEnvironmentInfoResponse, RequestId, RpcError, RpcRequest,
+    RpcResponse, RpcResponsePayload,
+};
 pub use platform::Platform;
 pub use request::*;
 pub use traits::Environment as EnvironmentOps;

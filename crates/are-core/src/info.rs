@@ -1,0 +1,216 @@
+//! GetEnvironmentInfo request/response types and RPC framing envelope.
+//!
+//! These types are transport-independent: they carry no knowledge of TLS,
+//! TCP, or HTTP. They represent the domain-level data exchanged between
+//! client and daemon for environment metadata queries.
+//!
+//! The RPC envelope wraps typed request/response payloads with a correlation
+//! ID so the client can match responses to requests over a multiplexed or
+//! sequential connection.
+
+use serde::{Deserialize, Serialize};
+
+use crate::{CapabilitySet, CoreError, EnvironmentId, Platform};
+
+// ---------------------------------------------------------------------------
+// GetEnvironmentInfo
+// ---------------------------------------------------------------------------
+
+/// Request to retrieve metadata about a remote environment.
+///
+/// The `environment_id` must match the daemon's configured environment.
+/// This is Gate 3's only operational request — no filesystem, process, or
+/// session operations are implemented yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetEnvironmentInfoRequest {
+    /// The environment to query. Must match the daemon's environment.
+    pub environment_id: EnvironmentId,
+}
+
+impl GetEnvironmentInfoRequest {
+    /// Validate the request fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CoreError::InvalidRequest` if the environment_id is empty
+    /// (in practice, `EnvironmentId` validation prevents this, but we check
+    /// defensively).
+    pub fn validate(&self) -> Result<(), CoreError> {
+        // EnvironmentId validation already prevents empty/invalid ids,
+        // but this is a belt-and-suspenders check.
+        if self.environment_id.as_str().is_empty() {
+            return Err(CoreError::InvalidRequest(
+                "environment_id must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Response containing metadata about a remote environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetEnvironmentInfoResponse {
+    /// The environment's unique identifier.
+    pub environment_id: EnvironmentId,
+    /// Machine hostname (e.g. "dev-vm", "prod-web-01").
+    pub machine_name: String,
+    /// Operating system name (e.g. "linux", "debian").
+    pub operating_system: String,
+    /// Daemon software version (crate version string).
+    pub daemon_version: String,
+    /// Capabilities available on this environment.
+    pub capabilities: CapabilitySet,
+    /// Platform type (Debian, Ubuntu, GenericLinux, etc.).
+    pub platform: Platform,
+}
+
+// ---------------------------------------------------------------------------
+// RPC Envelope
+// ---------------------------------------------------------------------------
+
+/// Unique identifier for a request-response pair.
+///
+/// Correlation IDs are client-generated and echoed in the response so the
+/// client can match responses to requests. For Gate 3's sequential model
+/// this is technically redundant, but it establishes the convention early
+/// and costs nothing.
+pub type RequestId = u64;
+
+/// An RPC request wrapping a typed payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum RpcRequest {
+    /// Retrieve environment metadata.
+    #[serde(rename = "get_environment_info")]
+    GetEnvironmentInfo(GetEnvironmentInfoRequest),
+}
+
+/// An RPC response wrapping a typed result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcResponse {
+    /// Correlation ID matching the request.
+    pub id: RequestId,
+    /// The result payload, or an error.
+    pub result: Result<RpcResponsePayload, RpcError>,
+}
+
+/// Successful RPC response payloads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum RpcResponsePayload {
+    /// Environment metadata response.
+    #[serde(rename = "get_environment_info")]
+    GetEnvironmentInfo(GetEnvironmentInfoResponse),
+}
+
+/// RPC-level error, distinct from `CoreError` (which is domain-level).
+///
+/// `RpcError` represents transport/framing/protocol failures. `CoreError`
+/// is carried inside a successful RPC response as a domain-level failure.
+#[derive(Debug, Clone, thiserror::Error, Serialize, Deserialize)]
+#[serde(tag = "code", content = "message")]
+pub enum RpcError {
+    /// The request payload could not be deserialized.
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+
+    /// The daemon does not recognize this request type.
+    #[error("unknown request type: {0}")]
+    UnknownRequestType(String),
+
+    /// An internal daemon error occurred.
+    #[error("internal error: {0}")]
+    InternalError(String),
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn get_environment_info_request_validate_ok() {
+        let req = GetEnvironmentInfoRequest {
+            environment_id: EnvironmentId::new("test-env"),
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn get_environment_info_request_serde_roundtrip() {
+        let req = GetEnvironmentInfoRequest {
+            environment_id: EnvironmentId::new("dev-vm"),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: GetEnvironmentInfoRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn get_environment_info_response_serde_roundtrip() {
+        let mut caps = CapabilitySet::default();
+        caps.insert(crate::Capability::FilesystemRead);
+        caps.insert(crate::Capability::ProcessExecute);
+
+        let resp = GetEnvironmentInfoResponse {
+            environment_id: EnvironmentId::new("prod-01"),
+            machine_name: "prod-01".into(),
+            operating_system: "linux".into(),
+            daemon_version: "0.1.0".into(),
+            capabilities: caps,
+            platform: Platform::Debian,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: GetEnvironmentInfoResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn rpc_request_serde_roundtrip() {
+        let req = RpcRequest::GetEnvironmentInfo(GetEnvironmentInfoRequest {
+            environment_id: EnvironmentId::new("dev"),
+        });
+        let json = serde_json::to_string(&req).unwrap();
+        let back: RpcRequest = serde_json::from_str(&json).unwrap();
+        // Compare via JSON since RpcRequest doesn't derive PartialEq
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn rpc_response_serde_roundtrip() {
+        let mut caps = CapabilitySet::default();
+        caps.insert(crate::Capability::FilesystemRead);
+
+        let resp = RpcResponse {
+            id: 42,
+            result: Ok(RpcResponsePayload::GetEnvironmentInfo(
+                GetEnvironmentInfoResponse {
+                    environment_id: EnvironmentId::new("dev"),
+                    machine_name: "dev".into(),
+                    operating_system: "linux".into(),
+                    daemon_version: "0.1.0".into(),
+                    capabilities: caps,
+                    platform: Platform::GenericLinux,
+                },
+            )),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: RpcResponse = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn rpc_error_serde_roundtrip() {
+        let err = RpcError::InvalidRequest("bad payload".into());
+        let json = serde_json::to_string(&err).unwrap();
+        let back: RpcError = serde_json::from_str(&json).unwrap();
+        assert_eq!(format!("{err}"), format!("{back}"));
+    }
+}

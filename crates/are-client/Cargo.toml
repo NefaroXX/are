@@ -9,7 +9,18 @@ repository.workspace = true
 
 [dependencies]
 are-core.workspace = true
+tokio.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+rustls-webpki.workspace = true
 
 [lints]
 workspace = true

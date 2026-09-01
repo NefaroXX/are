@@ -14,7 +14,14 @@ path = "src/main.rs"
 [dependencies]
 are-core.workspace = true
 are-client.workspace = true
-clap = { version = "4", features = ["derive"] }
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rustls.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
 
 [lints]
 workspace = true

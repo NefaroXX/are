@@ -1,6 +1,6 @@
 # ARE Architecture
 
-**Gate 2 — 2026-09-01**
+**Gate 3 — 2026-09-01**
 
 ---
 
@@ -257,7 +257,7 @@ This architecture is the foundation (Gate 0). Future gates add capability increm
 | 0 | Repository and architecture foundation | ✓ Complete |
 | 1 | Environment domain model | ✓ Complete |
 | 2 | Security model and identity design | ✓ Complete |
-| 3 | Minimal secure connection (TLS/mTLS) | Pending |
+| 3 | Minimal secure connection (TLS 1.3 mTLS + GetEnvironmentInfo) | ✓ Complete |
 | 4 | Read-only filesystem access | Pending |
 | 5 | Process execution (structured, no shell) | Pending |
 | 6 | Persistent agent sessions | Pending |
@@ -272,7 +272,7 @@ This architecture is the foundation (Gate 0). Future gates add capability increm
 
 **STOP gates** exist after every gate. No gate is started until the previous gate's deliverables are reviewed and approved.
 
-**Gate 0 is foundation only.** No networking implementation exists yet. No transport, no TLS, no remote communication. The crates contain only domain types and scaffold.
+**Gate 3 is minimal secure connection.** TLS 1.3 mTLS with length-prefixed JSON framing and GetEnvironmentInfo RPC. No filesystem or process operations yet. See `docs/identity.md` for trust model and `crates/are-daemon/tests/gate3_security.rs` for mTLS security tests.
 
 ---
 

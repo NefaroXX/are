@@ -7,6 +7,16 @@
 //!
 //! This crate **must not** execute local shell commands or perform implicit
 //! local filesystem access. All operations target the remote environment.
+//!
+//! ## Gate 3 scope
+//!
+//! Gate 3 implements `SecureClient` for mTLS connections with
+//! `GetEnvironmentInfo` RPC. No filesystem, process, or session operations
+//! exist yet.
+
+pub mod connection;
+pub mod framing;
+pub mod tls;
 
 use are_core::{EnvironmentId, SessionId};
 
