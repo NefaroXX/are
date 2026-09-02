@@ -16,6 +16,7 @@
 //! Protocol selection is documented in `tls.rs` and `framing.rs`.
 
 pub mod framing;
+pub mod fs;
 pub mod handler;
 pub mod server;
 pub mod tls;
@@ -37,6 +38,9 @@ pub struct DaemonConfig {
     pub server_key_path: Option<String>,
     /// Path to CA certificate PEM file (for client verification).
     pub client_ca_path: Option<String>,
+    /// Allowed root directory for filesystem operations.
+    /// If None, defaults to the current working directory.
+    pub allowed_root: Option<std::path::PathBuf>,
 }
 
 impl Default for DaemonConfig {
@@ -48,6 +52,7 @@ impl Default for DaemonConfig {
             server_cert_path: None,
             server_key_path: None,
             client_ca_path: None,
+            allowed_root: None,
         }
     }
 }
@@ -79,21 +84,32 @@ pub fn build_daemon_state(config: &DaemonConfig) -> crate::handler::DaemonState 
     let platform = detect_platform(&operating_system);
 
     let mut advertised_capabilities = CapabilitySet::default();
-    // Gate 3: mock all capabilities — no real filesystem or process ops yet.
+    // Gate 4: advertise only capabilities with enforceable handlers.
+    // read_file → FilesystemRead, list_directory → FilesystemList,
+    // file_metadata is an attribute read and maps to FilesystemRead.
     advertised_capabilities.insert(are_core::Capability::FilesystemRead);
-    advertised_capabilities.insert(are_core::Capability::FilesystemWrite);
     advertised_capabilities.insert(are_core::Capability::FilesystemList);
-    advertised_capabilities.insert(are_core::Capability::ProcessExecute);
-    advertised_capabilities.insert(are_core::Capability::ProcessInspect);
-    advertised_capabilities.insert(are_core::Capability::ProcessTerminate);
 
-    crate::handler::DaemonState::new(
+    // Build filesystem backend if allowed_root is configured.
+    let fs = config.allowed_root.as_ref().and_then(|root| {
+        match crate::fs::FilesystemConfig::new(std::slice::from_ref(root)) {
+            Ok(fs_config) => Some(crate::fs::FilesystemBackend::new(fs_config)),
+            Err(e) => {
+                eprintln!("WARNING: failed to configure filesystem backend: {e}");
+                None
+            }
+        }
+    });
+
+    let mut state = crate::handler::DaemonState::new(
         config.environment_id.clone(),
         machine_name,
         env!("CARGO_PKG_VERSION").to_string(),
         advertised_capabilities,
         platform,
-    )
+    );
+    state.fs = fs;
+    state
 }
 
 /// Detect the platform from the OS string.
@@ -152,6 +168,8 @@ pub fn run(_config: DaemonConfig) -> Result<(), DaemonError> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     #[test]
@@ -187,23 +205,44 @@ mod tests {
     fn build_daemon_state_has_all_capabilities() {
         let config = DaemonConfig::default();
         let state = build_daemon_state(&config);
+        // Gate 4: only capabilities with enforceable handlers are advertised.
         assert!(state
             .advertised_capabilities
             .contains(&are_core::Capability::FilesystemRead));
         assert!(state
             .advertised_capabilities
-            .contains(&are_core::Capability::FilesystemWrite));
-        assert!(state
-            .advertised_capabilities
             .contains(&are_core::Capability::FilesystemList));
-        assert!(state
+        // Write and process capabilities are NOT advertised (not yet implemented).
+        assert!(!state
+            .advertised_capabilities
+            .contains(&are_core::Capability::FilesystemWrite));
+        assert!(!state
             .advertised_capabilities
             .contains(&are_core::Capability::ProcessExecute));
-        assert!(state
+        assert!(!state
             .advertised_capabilities
             .contains(&are_core::Capability::ProcessInspect));
-        assert!(state
+        assert!(!state
             .advertised_capabilities
             .contains(&are_core::Capability::ProcessTerminate));
+        assert_eq!(state.advertised_capabilities.len(), 2);
+    }
+
+    #[test]
+    fn build_daemon_state_with_valid_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = DaemonConfig {
+            allowed_root: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        };
+        let state = build_daemon_state(&config);
+        assert!(state.fs.is_some());
+    }
+
+    #[test]
+    fn build_daemon_state_without_root() {
+        let config = DaemonConfig::default();
+        let state = build_daemon_state(&config);
+        assert!(state.fs.is_none());
     }
 }

@@ -1,16 +1,17 @@
 //! Request dispatch and handler for the daemon.
 //!
 //! Handles `RpcRequest` variants and returns `RpcResponse` values.
-//! Gate 3 only handles `GetEnvironmentInfo` — all other request types
-//! return `RpcError::UnknownRequestType`.
+//! Gate 3 handles `GetEnvironmentInfo`. Gate 4 adds `ReadFile`,
+//! `ListDirectory`, and `GetFileMetadata`.
 
 use are_core::{
     CapabilitySet, EnvironmentId, GetEnvironmentInfoRequest, GetEnvironmentInfoResponse, Platform,
     RpcError, RpcRequest, RpcResponse, RpcResponsePayload,
 };
 
+use crate::fs::{FilesystemBackend, FsError};
+
 /// Daemon state needed to handle requests.
-#[derive(Debug, Clone)]
 pub struct DaemonState {
     /// The environment this daemon serves.
     pub environment_id: EnvironmentId,
@@ -25,6 +26,8 @@ pub struct DaemonState {
     pub advertised_capabilities: CapabilitySet,
     /// Platform type.
     pub platform: Platform,
+    /// Filesystem backend (None for backward-compatible tests without FS).
+    pub fs: Option<FilesystemBackend>,
 }
 
 impl DaemonState {
@@ -42,6 +45,26 @@ impl DaemonState {
             daemon_version,
             advertised_capabilities,
             platform,
+            fs: None,
+        }
+    }
+
+    /// Create a new `DaemonState` with a filesystem backend.
+    pub fn with_fs(
+        environment_id: EnvironmentId,
+        machine_name: String,
+        daemon_version: String,
+        advertised_capabilities: CapabilitySet,
+        platform: Platform,
+        fs: FilesystemBackend,
+    ) -> Self {
+        Self {
+            environment_id,
+            machine_name,
+            daemon_version,
+            advertised_capabilities,
+            platform,
+            fs: Some(fs),
         }
     }
 
@@ -52,6 +75,24 @@ impl DaemonState {
                 let result = self.handle_get_environment_info(req);
                 RpcResponse {
                     result: result.map(RpcResponsePayload::GetEnvironmentInfo),
+                }
+            }
+            RpcRequest::ReadFile(req) => {
+                let result = self.handle_read_file(req);
+                RpcResponse {
+                    result: result.map(RpcResponsePayload::ReadFile),
+                }
+            }
+            RpcRequest::ListDirectory(req) => {
+                let result = self.handle_list_directory(req);
+                RpcResponse {
+                    result: result.map(RpcResponsePayload::ListDirectory),
+                }
+            }
+            RpcRequest::GetFileMetadata(req) => {
+                let result = self.handle_get_file_metadata(req);
+                RpcResponse {
+                    result: result.map(RpcResponsePayload::GetFileMetadata),
                 }
             }
         }
@@ -77,6 +118,105 @@ impl DaemonState {
             advertised_capabilities: self.advertised_capabilities.clone(),
             platform: self.platform.clone(),
         })
+    }
+
+    fn handle_read_file(
+        &self,
+        req: are_core::ReadFileRequest,
+    ) -> Result<are_core::ReadFileResponse, RpcError> {
+        if req.environment_id != self.environment_id {
+            return Err(RpcError::InvalidRequest(format!(
+                "requested environment '{}' does not match daemon environment '{}'",
+                req.environment_id, self.environment_id
+            )));
+        }
+
+        let fs = self
+            .fs
+            .as_ref()
+            .ok_or_else(|| RpcError::InternalError("filesystem backend not configured".into()))?;
+
+        let req_clone = req.clone();
+        // Block on async FS operation within the sync handler.
+        let (content, metadata) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { fs.read_file(&req_clone.path).await })
+        })
+        .map_err(|e| fs_error_to_rpc(e, &req.path))?;
+
+        Ok(are_core::ReadFileResponse { content, metadata })
+    }
+
+    fn handle_list_directory(
+        &self,
+        req: are_core::ListDirectoryRequest,
+    ) -> Result<are_core::ListDirectoryResponse, RpcError> {
+        if req.environment_id != self.environment_id {
+            return Err(RpcError::InvalidRequest(format!(
+                "requested environment '{}' does not match daemon environment '{}'",
+                req.environment_id, self.environment_id
+            )));
+        }
+
+        let fs = self
+            .fs
+            .as_ref()
+            .ok_or_else(|| RpcError::InternalError("filesystem backend not configured".into()))?;
+
+        let req_clone = req.clone();
+        let entries = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { fs.list_directory(&req_clone.path).await })
+        })
+        .map_err(|e| fs_error_to_rpc(e, &req.path))?;
+
+        Ok(are_core::ListDirectoryResponse { entries })
+    }
+
+    fn handle_get_file_metadata(
+        &self,
+        req: are_core::GetFileMetadataRequest,
+    ) -> Result<are_core::GetFileMetadataResponse, RpcError> {
+        if req.environment_id != self.environment_id {
+            return Err(RpcError::InvalidRequest(format!(
+                "requested environment '{}' does not match daemon environment '{}'",
+                req.environment_id, self.environment_id
+            )));
+        }
+
+        let fs = self
+            .fs
+            .as_ref()
+            .ok_or_else(|| RpcError::InternalError("filesystem backend not configured".into()))?;
+
+        let req_clone = req.clone();
+        let metadata = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { fs.file_metadata(&req_clone.path).await })
+        })
+        .map_err(|e| fs_error_to_rpc(e, &req.path))?;
+
+        Ok(are_core::GetFileMetadataResponse { metadata })
+    }
+}
+
+/// Map a filesystem error to an RPC error, preserving the error category.
+fn fs_error_to_rpc(err: FsError, path: &str) -> RpcError {
+    match &err {
+        FsError::InvalidPath(msg) => RpcError::InvalidRequest(format!("{path}: {msg}")),
+        FsError::FilesystemEscape(msg) => {
+            RpcError::InternalError(format!("filesystem escape blocked: {msg}"))
+        }
+        FsError::NotFound(_) => RpcError::InternalError(format!("{path}: not found")),
+        FsError::PermissionDenied(_) => {
+            RpcError::InternalError(format!("{path}: permission denied"))
+        }
+        FsError::NotADirectory(_) => RpcError::InternalError(format!("{path}: not a directory")),
+        FsError::IsADirectory(_) => RpcError::InternalError(format!("{path}: is a directory")),
+        FsError::FileTooLarge { path, size, limit } => RpcError::InternalError(format!(
+            "file too large: {path} is {size} bytes, limit is {limit} bytes"
+        )),
+        FsError::Io(msg) => RpcError::InternalError(format!("{path}: I/O error: {msg}")),
     }
 }
 
@@ -135,6 +275,114 @@ mod tests {
         let state = test_state();
         let req = RpcRequest::GetEnvironmentInfo(GetEnvironmentInfoRequest {
             environment_id: EnvironmentId::new("wrong-env"),
+        });
+
+        let resp = state.handle(req);
+        assert!(resp.result.is_err());
+        match resp.result {
+            Err(RpcError::InvalidRequest(msg)) => {
+                assert!(msg.contains("does not match"));
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_read_file_without_fs_backend() {
+        let state = test_state();
+        let req = RpcRequest::ReadFile(are_core::ReadFileRequest {
+            environment_id: EnvironmentId::new("test-env"),
+            path: "test.txt".into(),
+        });
+
+        let resp = state.handle(req);
+        assert!(resp.result.is_err());
+        match resp.result {
+            Err(RpcError::InternalError(msg)) => {
+                assert!(msg.contains("filesystem backend not configured"));
+            }
+            other => panic!("expected InternalError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_list_directory_without_fs_backend() {
+        let state = test_state();
+        let req = RpcRequest::ListDirectory(are_core::ListDirectoryRequest {
+            environment_id: EnvironmentId::new("test-env"),
+            path: ".".into(),
+        });
+
+        let resp = state.handle(req);
+        assert!(resp.result.is_err());
+        match resp.result {
+            Err(RpcError::InternalError(msg)) => {
+                assert!(msg.contains("filesystem backend not configured"));
+            }
+            other => panic!("expected InternalError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_get_file_metadata_without_fs_backend() {
+        let state = test_state();
+        let req = RpcRequest::GetFileMetadata(are_core::GetFileMetadataRequest {
+            environment_id: EnvironmentId::new("test-env"),
+            path: "test.txt".into(),
+        });
+
+        let resp = state.handle(req);
+        assert!(resp.result.is_err());
+        match resp.result {
+            Err(RpcError::InternalError(msg)) => {
+                assert!(msg.contains("filesystem backend not configured"));
+            }
+            other => panic!("expected InternalError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_read_file_wrong_env() {
+        let state = test_state();
+        let req = RpcRequest::ReadFile(are_core::ReadFileRequest {
+            environment_id: EnvironmentId::new("wrong-env"),
+            path: "test.txt".into(),
+        });
+
+        let resp = state.handle(req);
+        assert!(resp.result.is_err());
+        match resp.result {
+            Err(RpcError::InvalidRequest(msg)) => {
+                assert!(msg.contains("does not match"));
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_list_directory_wrong_env() {
+        let state = test_state();
+        let req = RpcRequest::ListDirectory(are_core::ListDirectoryRequest {
+            environment_id: EnvironmentId::new("wrong-env"),
+            path: ".".into(),
+        });
+
+        let resp = state.handle(req);
+        assert!(resp.result.is_err());
+        match resp.result {
+            Err(RpcError::InvalidRequest(msg)) => {
+                assert!(msg.contains("does not match"));
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_get_file_metadata_wrong_env() {
+        let state = test_state();
+        let req = RpcRequest::GetFileMetadata(are_core::GetFileMetadataRequest {
+            environment_id: EnvironmentId::new("wrong-env"),
+            path: "test.txt".into(),
         });
 
         let resp = state.handle(req);

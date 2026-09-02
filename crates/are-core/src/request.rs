@@ -143,6 +143,40 @@ pub struct WriteFileResponse {
 }
 
 // ---------------------------------------------------------------------------
+// GetFileMetadata
+// ---------------------------------------------------------------------------
+
+/// Request to get metadata about a file or directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetFileMetadataRequest {
+    /// Target environment.
+    pub environment_id: EnvironmentId,
+    /// Environment-relative path, resolved against the daemon's configured
+    /// allowed roots. Absolute host paths are rejected by default; see
+    /// `docs/decisions/002-path-semantics.md`.
+    pub path: String,
+}
+
+impl GetFileMetadataRequest {
+    /// Validate the request fields.
+    pub fn validate(&self) -> Result<(), crate::CoreError> {
+        if self.path.is_empty() {
+            return Err(crate::CoreError::InvalidRequest(
+                "path must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Response from getting file metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetFileMetadataResponse {
+    /// Metadata about the file or directory.
+    pub metadata: FileMetadata,
+}
+
+// ---------------------------------------------------------------------------
 // ListDirectory
 // ---------------------------------------------------------------------------
 
@@ -341,6 +375,24 @@ mod tests {
     }
 
     #[test]
+    fn get_file_metadata_validate_valid() {
+        let req = GetFileMetadataRequest {
+            environment_id: eid(),
+            path: "/tmp/test".into(),
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn get_file_metadata_validate_empty_path() {
+        let req = GetFileMetadataRequest {
+            environment_id: eid(),
+            path: String::new(),
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
     fn list_dir_validate_valid() {
         let req = ListDirectoryRequest {
             environment_id: eid(),
@@ -459,6 +511,24 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: ListDirectoryResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn get_file_metadata_roundtrip() {
+        let req = GetFileMetadataRequest {
+            environment_id: eid(),
+            path: "/src/main.rs".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: GetFileMetadataRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+
+        let resp = GetFileMetadataResponse {
+            metadata: file_meta(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: GetFileMetadataResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(resp, back);
     }
 

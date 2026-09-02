@@ -32,6 +32,7 @@ rustls = { workspace = true, features = ["tls12"] }
 rustls-webpki.workspace = true
 tokio.workspace = true
 time = "0.3"
+tempfile.workspace = true
 
 [lints]
 workspace = true

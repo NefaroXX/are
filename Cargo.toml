@@ -30,6 +30,7 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 hostname = "0.4"
+tempfile = "3"
 are-core = { path = "crates/are-core" }
 are-client = { path = "crates/are-client" }
 

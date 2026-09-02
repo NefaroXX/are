@@ -40,6 +40,12 @@ pub trait Environment: Send + Sync {
         req: ListDirectoryRequest,
     ) -> Result<ListDirectoryResponse, CoreError>;
 
+    /// Get metadata about a file or directory.
+    async fn file_metadata(
+        &self,
+        req: GetFileMetadataRequest,
+    ) -> Result<GetFileMetadataResponse, CoreError>;
+
     /// Execute a process in the environment.
     #[cfg(any(test, feature = "future"))]
     async fn execute(&self, req: ExecuteRequest) -> Result<ExecuteResponse, CoreError>;
@@ -100,6 +106,20 @@ mod tests {
             _req: ListDirectoryRequest,
         ) -> Result<ListDirectoryResponse, CoreError> {
             Ok(ListDirectoryResponse { entries: vec![] })
+        }
+
+        async fn file_metadata(
+            &self,
+            _req: GetFileMetadataRequest,
+        ) -> Result<GetFileMetadataResponse, CoreError> {
+            Ok(GetFileMetadataResponse {
+                metadata: FileMetadata {
+                    size: 0,
+                    modified_at: None,
+                    is_dir: false,
+                    is_file: true,
+                },
+            })
         }
 
         #[cfg(any(test, feature = "future"))]

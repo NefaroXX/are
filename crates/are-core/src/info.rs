@@ -10,7 +10,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CapabilitySet, CoreError, EnvironmentId, Platform};
+use crate::{
+    CapabilitySet, CoreError, EnvironmentId, GetFileMetadataRequest, GetFileMetadataResponse,
+    ListDirectoryRequest, ListDirectoryResponse, Platform, ReadFileRequest, ReadFileResponse,
+};
 
 // ---------------------------------------------------------------------------
 // GetEnvironmentInfo
@@ -78,6 +81,15 @@ pub enum RpcRequest {
     /// Retrieve environment metadata.
     #[serde(rename = "get_environment_info")]
     GetEnvironmentInfo(GetEnvironmentInfoRequest),
+    /// Read a file from the environment.
+    #[serde(rename = "read_file")]
+    ReadFile(ReadFileRequest),
+    /// List directory contents.
+    #[serde(rename = "list_directory")]
+    ListDirectory(ListDirectoryRequest),
+    /// Get file/directory metadata.
+    #[serde(rename = "get_file_metadata")]
+    GetFileMetadata(GetFileMetadataRequest),
 }
 
 /// An RPC response wrapping a typed result.
@@ -94,6 +106,15 @@ pub enum RpcResponsePayload {
     /// Environment metadata response.
     #[serde(rename = "get_environment_info")]
     GetEnvironmentInfo(GetEnvironmentInfoResponse),
+    /// File read response.
+    #[serde(rename = "read_file")]
+    ReadFile(ReadFileResponse),
+    /// Directory listing response.
+    #[serde(rename = "list_directory")]
+    ListDirectory(ListDirectoryResponse),
+    /// File metadata response.
+    #[serde(rename = "get_file_metadata")]
+    GetFileMetadata(GetFileMetadataResponse),
 }
 
 /// RPC-level error, distinct from `CoreError` (which is domain-level).
@@ -204,5 +225,93 @@ mod tests {
         let json = serde_json::to_string(&err).unwrap();
         let back: RpcError = serde_json::from_str(&json).unwrap();
         assert_eq!(format!("{err}"), format!("{back}"));
+    }
+
+    #[test]
+    fn rpc_request_read_file_roundtrip() {
+        let req = RpcRequest::ReadFile(ReadFileRequest {
+            environment_id: EnvironmentId::new("dev"),
+            path: "/src/main.rs".into(),
+        });
+        let json = serde_json::to_string(&req).unwrap();
+        let back: RpcRequest = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn rpc_request_list_directory_roundtrip() {
+        let req = RpcRequest::ListDirectory(ListDirectoryRequest {
+            environment_id: EnvironmentId::new("dev"),
+            path: "/src".into(),
+        });
+        let json = serde_json::to_string(&req).unwrap();
+        let back: RpcRequest = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn rpc_request_get_file_metadata_roundtrip() {
+        let req = RpcRequest::GetFileMetadata(GetFileMetadataRequest {
+            environment_id: EnvironmentId::new("dev"),
+            path: "/src/main.rs".into(),
+        });
+        let json = serde_json::to_string(&req).unwrap();
+        let back: RpcRequest = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn rpc_response_read_file_roundtrip() {
+        let resp = RpcResponse {
+            result: Ok(RpcResponsePayload::ReadFile(ReadFileResponse {
+                content: b"hello".to_vec(),
+                metadata: crate::request::FileMetadata {
+                    size: 5,
+                    modified_at: None,
+                    is_dir: false,
+                    is_file: true,
+                },
+            })),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: RpcResponse = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn rpc_response_list_directory_roundtrip() {
+        let resp = RpcResponse {
+            result: Ok(RpcResponsePayload::ListDirectory(ListDirectoryResponse {
+                entries: vec![],
+            })),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: RpcResponse = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn rpc_response_get_file_metadata_roundtrip() {
+        let resp = RpcResponse {
+            result: Ok(RpcResponsePayload::GetFileMetadata(
+                GetFileMetadataResponse {
+                    metadata: crate::request::FileMetadata {
+                        size: 100,
+                        modified_at: None,
+                        is_dir: false,
+                        is_file: true,
+                    },
+                },
+            )),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: RpcResponse = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json, json2);
     }
 }

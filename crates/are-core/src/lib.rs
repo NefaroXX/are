@@ -39,7 +39,7 @@ pub use info::{
 };
 pub use platform::Platform;
 pub use request::{
-    DirectoryEntry, FileMetadata, ListDirectoryRequest, ListDirectoryResponse, ReadFileRequest,
-    ReadFileResponse,
+    DirectoryEntry, FileMetadata, GetFileMetadataRequest, GetFileMetadataResponse,
+    ListDirectoryRequest, ListDirectoryResponse, ReadFileRequest, ReadFileResponse,
 };
 pub use traits::Environment as EnvironmentOps;

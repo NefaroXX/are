@@ -102,6 +102,63 @@ impl SecureClient {
         &self,
         environment_id: &EnvironmentId,
     ) -> Result<GetEnvironmentInfoResponse, ConnectionError> {
+        let response = self
+            .send_rpc(RpcRequest::GetEnvironmentInfo(GetEnvironmentInfoRequest {
+                environment_id: environment_id.clone(),
+            }))
+            .await?;
+
+        match response.result {
+            Ok(RpcResponsePayload::GetEnvironmentInfo(info)) => Ok(info),
+            Err(e) => Err(ConnectionError::RpcError(e.to_string())),
+            _ => Err(ConnectionError::UnexpectedResponse),
+        }
+    }
+
+    /// Read a file from the remote environment.
+    pub async fn read_file(
+        &self,
+        req: are_core::ReadFileRequest,
+    ) -> Result<are_core::ReadFileResponse, ConnectionError> {
+        let response = self.send_rpc(RpcRequest::ReadFile(req)).await?;
+
+        match response.result {
+            Ok(RpcResponsePayload::ReadFile(resp)) => Ok(resp),
+            Err(e) => Err(ConnectionError::RpcError(e.to_string())),
+            _ => Err(ConnectionError::UnexpectedResponse),
+        }
+    }
+
+    /// List the contents of a remote directory.
+    pub async fn list_directory(
+        &self,
+        req: are_core::ListDirectoryRequest,
+    ) -> Result<are_core::ListDirectoryResponse, ConnectionError> {
+        let response = self.send_rpc(RpcRequest::ListDirectory(req)).await?;
+
+        match response.result {
+            Ok(RpcResponsePayload::ListDirectory(resp)) => Ok(resp),
+            Err(e) => Err(ConnectionError::RpcError(e.to_string())),
+            _ => Err(ConnectionError::UnexpectedResponse),
+        }
+    }
+
+    /// Get metadata about a file or directory in the remote environment.
+    pub async fn file_metadata(
+        &self,
+        req: are_core::GetFileMetadataRequest,
+    ) -> Result<are_core::GetFileMetadataResponse, ConnectionError> {
+        let response = self.send_rpc(RpcRequest::GetFileMetadata(req)).await?;
+
+        match response.result {
+            Ok(RpcResponsePayload::GetFileMetadata(resp)) => Ok(resp),
+            Err(e) => Err(ConnectionError::RpcError(e.to_string())),
+            _ => Err(ConnectionError::UnexpectedResponse),
+        }
+    }
+
+    /// Send an RPC request and return the response.
+    async fn send_rpc(&self, request: RpcRequest) -> Result<RpcResponse, ConnectionError> {
         // Establish TCP connection.
         let tcp = TcpStream::connect(&self.server_addr).await?;
 
@@ -117,19 +174,7 @@ impl SecureClient {
         let mut reader = io::BufReader::new(read_half);
         let mut writer = io::BufWriter::new(write_half);
 
-        // Send request.
-        let request = RpcRequest::GetEnvironmentInfo(GetEnvironmentInfoRequest {
-            environment_id: environment_id.clone(),
-        });
-
         framing::write_message(&mut writer, &request).await?;
-
-        // Read response.
-        let response: RpcResponse = framing::read_message(&mut reader).await?;
-
-        match response.result {
-            Ok(RpcResponsePayload::GetEnvironmentInfo(info)) => Ok(info),
-            Err(e) => Err(ConnectionError::RpcError(e.to_string())),
-        }
+        Ok(framing::read_message(&mut reader).await?)
     }
 }

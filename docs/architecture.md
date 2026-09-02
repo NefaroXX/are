@@ -1,6 +1,6 @@
 # ARE Architecture
 
-**Gate 3.5 — 2026-09-01**
+**Gate 4 — 2026-09-01**
 
 ---
 
@@ -267,7 +267,7 @@ This architecture is the foundation (Gate 0). Future gates add capability increm
 | 2 | Security model and identity design | ✓ Complete |
 | 3 | Minimal secure connection (TLS 1.3 mTLS + GetEnvironmentInfo) | ✓ Complete (scoped: TLS 1.3 mTLS + GetEnvironmentInfo only; revocation/rotation/capability enforcement = designed) |
 | 3.5 | Boundary cleanup (implemented vs designed, ADRs, advertised_capabilities, path semantics) | ✓ Complete |
-| 4 | Read-only filesystem access | Pending |
+| 4 | Read-only filesystem access | ✓ Complete (env-relative, allowed roots, traversal/symlink/escape/TOCTOU, file_metadata, 16 MiB cap, advertised read+list) |
 | 5 | Process execution (structured, no shell) | Pending |
 | 6 | Persistent agent sessions | Pending |
 | 7 | Filesystem write operations | Pending |
@@ -281,7 +281,7 @@ This architecture is the foundation (Gate 0). Future gates add capability increm
 
 **STOP gates** exist after every gate. No gate is started until the previous gate's deliverables are reviewed and approved.
 
-**Gate 3 is minimal secure connection.** TLS 1.3 mTLS with length-prefixed JSON framing and GetEnvironmentInfo RPC. No filesystem or process operations yet. See `docs/identity.md` for trust model and `crates/are-daemon/tests/gate3_security.rs` for mTLS security tests.
+**Gate 4 is read-only filesystem.** Env-relative paths (ADR-002) resolved against allowed roots with canonicalization, symlink and boundary escape protection, TOCTOU parent canonicalization, 16 MiB file cap, and `file_metadata` operation. Advertised capabilities are `filesystem.read` + `filesystem.list` only. See `crates/are-daemon/src/fs.rs` for enforcement and `docs/decisions/002-path-semantics.md` for path contract.
 
 ---
 

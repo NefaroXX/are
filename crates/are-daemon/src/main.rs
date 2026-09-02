@@ -58,6 +58,11 @@ enum Commands {
         /// Path to CA certificate PEM file (for client verification)
         #[arg(long)]
         ca: Option<PathBuf>,
+
+        /// Allowed root directory for filesystem operations.
+        /// Defaults to the current working directory if not specified.
+        #[arg(long)]
+        allowed_root: Option<PathBuf>,
     },
 }
 
@@ -81,9 +86,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cert,
             key,
             ca,
+            allowed_root,
         } => {
             let env_id = EnvironmentId::try_new(&environment_id)
                 .map_err(|e| format!("invalid environment_id: {e}"))?;
+
+            // Determine the allowed root: use provided path or fall back to cwd.
+            let root = match allowed_root {
+                Some(path) => {
+                    if !path.exists() {
+                        eprintln!(
+                            "error: allowed-root path does not exist: {}",
+                            path.display()
+                        );
+                        std::process::exit(1);
+                    }
+                    Some(path)
+                }
+                None => {
+                    let cwd = std::env::current_dir()
+                        .map_err(|e| format!("failed to get current directory: {e}"))?;
+                    tracing::warn!(
+                        "no --allowed-root specified, defaulting to current directory: {}",
+                        cwd.display()
+                    );
+                    Some(cwd)
+                }
+            };
 
             let config = DaemonConfig {
                 environment_id: env_id,
@@ -92,6 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 server_cert_path: cert.as_ref().map(|p| p.display().to_string()),
                 server_key_path: key.as_ref().map(|p| p.display().to_string()),
                 client_ca_path: ca.as_ref().map(|p| p.display().to_string()),
+                allowed_root: root,
             };
 
             let state = are_daemon::build_daemon_state(&config);

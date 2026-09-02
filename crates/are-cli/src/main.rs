@@ -77,11 +77,112 @@ enum Commands {
         env_id: String,
     },
 
+    /// Filesystem operations on a remote environment
+    Fs {
+        /// Subcommand: read, list, metadata
+        #[command(subcommand)]
+        action: FsAction,
+    },
+
     /// Manage remote environments
     Env {
         /// Subcommand: list, add, remove
         #[command(subcommand)]
         action: EnvAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum FsAction {
+    /// Read a file from the remote environment
+    Read {
+        /// Server address (host:port)
+        #[arg(long, default_value = "127.0.0.1:9000")]
+        addr: String,
+
+        /// Path to client certificate PEM
+        #[arg(long)]
+        cert: PathBuf,
+
+        /// Path to client private key PEM
+        #[arg(long)]
+        key: PathBuf,
+
+        /// Path to CA certificate PEM
+        #[arg(long)]
+        ca: PathBuf,
+
+        /// Server hostname for SNI
+        #[arg(long, default_value = "localhost")]
+        server_name: String,
+
+        /// Environment ID
+        #[arg(long, default_value = "default")]
+        env_id: String,
+
+        /// Environment-relative path to read
+        path: String,
+    },
+
+    /// List directory contents on the remote environment
+    List {
+        /// Server address (host:port)
+        #[arg(long, default_value = "127.0.0.1:9000")]
+        addr: String,
+
+        /// Path to client certificate PEM
+        #[arg(long)]
+        cert: PathBuf,
+
+        /// Path to client private key PEM
+        #[arg(long)]
+        key: PathBuf,
+
+        /// Path to CA certificate PEM
+        #[arg(long)]
+        ca: PathBuf,
+
+        /// Server hostname for SNI
+        #[arg(long, default_value = "localhost")]
+        server_name: String,
+
+        /// Environment ID
+        #[arg(long, default_value = "default")]
+        env_id: String,
+
+        /// Environment-relative path to list
+        #[arg(default_value = ".")]
+        path: String,
+    },
+
+    /// Get metadata about a file or directory
+    Metadata {
+        /// Server address (host:port)
+        #[arg(long, default_value = "127.0.0.1:9000")]
+        addr: String,
+
+        /// Path to client certificate PEM
+        #[arg(long)]
+        cert: PathBuf,
+
+        /// Path to client private key PEM
+        #[arg(long)]
+        key: PathBuf,
+
+        /// Path to CA certificate PEM
+        #[arg(long)]
+        ca: PathBuf,
+
+        /// Server hostname for SNI
+        #[arg(long, default_value = "localhost")]
+        server_name: String,
+
+        /// Environment ID
+        #[arg(long, default_value = "default")]
+        env_id: String,
+
+        /// Environment-relative path to inspect
+        path: String,
     },
 }
 
@@ -209,6 +310,154 @@ async fn main() {
                 }
             }
         }
+
+        Commands::Fs { action } => match action {
+            FsAction::Read {
+                addr,
+                cert,
+                key,
+                ca,
+                server_name,
+                env_id,
+                path,
+            } => {
+                let env_id = match EnvironmentId::try_new(&env_id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        eprintln!("error: invalid environment_id: {e}");
+                        std::process::exit(1);
+                    }
+                };
+
+                let client =
+                    match SecureClient::from_pem_files(&cert, &key, &ca, &addr, &server_name) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("error: failed to configure TLS: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                let req = are_core::ReadFileRequest {
+                    environment_id: env_id,
+                    path,
+                };
+
+                match client.read_file(req).await {
+                    Ok(resp) => {
+                        // Write content to stdout.
+                        if let Err(e) =
+                            std::io::Write::write_all(&mut std::io::stdout(), &resp.content)
+                        {
+                            eprintln!("error: failed to write to stdout: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            FsAction::List {
+                addr,
+                cert,
+                key,
+                ca,
+                server_name,
+                env_id,
+                path,
+            } => {
+                let env_id = match EnvironmentId::try_new(&env_id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        eprintln!("error: invalid environment_id: {e}");
+                        std::process::exit(1);
+                    }
+                };
+
+                let client =
+                    match SecureClient::from_pem_files(&cert, &key, &ca, &addr, &server_name) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("error: failed to configure TLS: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                let req = are_core::ListDirectoryRequest {
+                    environment_id: env_id,
+                    path,
+                };
+
+                match client.list_directory(req).await {
+                    Ok(resp) => {
+                        for entry in &resp.entries {
+                            let kind = if entry.metadata.is_dir {
+                                "d"
+                            } else if entry.metadata.is_file {
+                                "-"
+                            } else {
+                                "?"
+                            };
+                            println!("{} {:>8} {}", kind, entry.metadata.size, entry.path);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            FsAction::Metadata {
+                addr,
+                cert,
+                key,
+                ca,
+                server_name,
+                env_id,
+                path,
+            } => {
+                let env_id = match EnvironmentId::try_new(&env_id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        eprintln!("error: invalid environment_id: {e}");
+                        std::process::exit(1);
+                    }
+                };
+
+                let client =
+                    match SecureClient::from_pem_files(&cert, &key, &ca, &addr, &server_name) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("error: failed to configure TLS: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                let req = are_core::GetFileMetadataRequest {
+                    environment_id: env_id,
+                    path,
+                };
+
+                match client.file_metadata(req).await {
+                    Ok(resp) => {
+                        println!("Size:     {} bytes", resp.metadata.size);
+                        println!("Is file:  {}", resp.metadata.is_file);
+                        println!("Is dir:   {}", resp.metadata.is_dir);
+                        if let Some(modified) = resp.metadata.modified_at {
+                            println!("Modified: {modified:?}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
 
         Commands::Env { action } => match action {
             EnvAction::List => println!("env list: no environments configured yet"),
