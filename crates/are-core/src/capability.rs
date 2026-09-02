@@ -1,8 +1,12 @@
-//! Capability model for environment authorization.
+//! Capability model for environment operations.
 //!
-//! Capabilities represent discrete permissions that can be granted to clients.
-//! Each capability is a single, non-overlapping authorization — for example,
-//! `filesystem.read` is distinct from `filesystem.write`.
+//! Capabilities represent discrete operations that an environment advertises
+//! as available. They describe what the environment *claims* to support —
+//! they are NOT per-client authorization.
+//!
+//! **Gate 8** will introduce per-client scoped authorization. Until then,
+//! every connected client sees the same advertised capability set. Do not
+//! confuse `advertised_capabilities` with access control.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -74,7 +78,11 @@ impl<'de> Deserialize<'de> for Capability {
 // CapabilitySet
 // ---------------------------------------------------------------------------
 
-/// An unordered set of capabilities granted to a client.
+/// An unordered set of capabilities advertised by an environment.
+///
+/// This represents the operations the environment claims to support.
+/// It is NOT per-client authorization — all clients see the same set.
+/// Per-client capability enforcement arrives in Gate 8.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CapabilitySet(HashSet<Capability>);
 

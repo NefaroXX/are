@@ -21,6 +21,9 @@ use async_trait::async_trait;
 /// Every method is transport-independent: the same trait is used for local,
 /// remote, and future container implementations. No implementation may
 /// silently fall back to local execution.
+///
+/// Only `read_file` and `list_directory` are part of the stable API (Gate 3.5).
+/// The remaining methods are gated behind `feature = "future"`.
 #[async_trait]
 #[allow(dead_code)]
 pub trait Environment: Send + Sync {
@@ -28,6 +31,7 @@ pub trait Environment: Send + Sync {
     async fn read_file(&self, req: ReadFileRequest) -> Result<ReadFileResponse, CoreError>;
 
     /// Write content to a file.
+    #[cfg(any(test, feature = "future"))]
     async fn write_file(&self, req: WriteFileRequest) -> Result<WriteFileResponse, CoreError>;
 
     /// List the entries in a directory.
@@ -37,15 +41,18 @@ pub trait Environment: Send + Sync {
     ) -> Result<ListDirectoryResponse, CoreError>;
 
     /// Execute a process in the environment.
+    #[cfg(any(test, feature = "future"))]
     async fn execute(&self, req: ExecuteRequest) -> Result<ExecuteResponse, CoreError>;
 
     /// Query the status of a running or completed process.
+    #[cfg(any(test, feature = "future"))]
     async fn process_status(
         &self,
         req: ProcessStatusRequest,
     ) -> Result<ProcessStatusResponse, CoreError>;
 
     /// Terminate a process (SIGTERM) or force-kill it (SIGKILL).
+    #[cfg(any(test, feature = "future"))]
     async fn terminate_process(
         &self,
         req: TerminateProcessRequest,
@@ -76,6 +83,7 @@ mod tests {
             })
         }
 
+        #[cfg(any(test, feature = "future"))]
         async fn write_file(&self, _req: WriteFileRequest) -> Result<WriteFileResponse, CoreError> {
             Ok(WriteFileResponse {
                 metadata: FileMetadata {
@@ -94,12 +102,14 @@ mod tests {
             Ok(ListDirectoryResponse { entries: vec![] })
         }
 
+        #[cfg(any(test, feature = "future"))]
         async fn execute(&self, _req: ExecuteRequest) -> Result<ExecuteResponse, CoreError> {
             Ok(ExecuteResponse {
                 process_id: ProcessId::new("mock-proc"),
             })
         }
 
+        #[cfg(any(test, feature = "future"))]
         async fn process_status(
             &self,
             _req: ProcessStatusRequest,
@@ -109,6 +119,7 @@ mod tests {
             })
         }
 
+        #[cfg(any(test, feature = "future"))]
         async fn terminate_process(
             &self,
             _req: TerminateProcessRequest,

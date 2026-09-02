@@ -181,8 +181,12 @@ async fn test_valid_mtls_connect_and_get_info() {
     assert_eq!(info.machine_name, "test-host");
     assert_eq!(info.daemon_version, "0.1.0");
     assert_eq!(info.platform, Platform::Debian);
-    assert!(info.capabilities.contains(&Capability::FilesystemRead));
-    assert!(info.capabilities.contains(&Capability::ProcessExecute));
+    assert!(info
+        .advertised_capabilities
+        .contains(&Capability::FilesystemRead));
+    assert!(info
+        .advertised_capabilities
+        .contains(&Capability::ProcessExecute));
 }
 
 /// Gate 3: client cert signed by unknown CA is rejected by daemon.
@@ -302,6 +306,62 @@ async fn test_unknown_credential_rejected() {
     let result = client.get_environment_info(&env_id).await;
 
     assert!(result.is_err(), "should fail with unknown CA credential");
+}
+
+/// Gate 3.5: TLS 1.2 client is rejected by TLS 1.3-only server.
+///
+/// The server is built with `build_server_config`, which restricts to TLS
+/// 1.3 only. The client is restricted to TLS 1.2 only. Since there is no
+/// overlapping protocol version, the handshake fails immediately — the
+/// client cannot negotiate a version the server supports.
+#[tokio::test]
+async fn test_tls12_rejected() {
+    let (ca_cert, ca_key) = make_ca("Test Root CA");
+    let (server_cert, server_key) = make_signed_cert(&ca_cert, &ca_key, "localhost");
+    let (client_cert, client_key) = make_signed_cert(&ca_cert, &ca_key, "test-client");
+
+    let ca_cert_der = ca_cert.der().clone();
+
+    // Server: TLS 1.3 only (production path via build_server_config).
+    let server_config =
+        tls::build_server_config(vec![server_cert], server_key.clone_key(), &ca_cert_der).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let acceptor = TlsAcceptor::from(server_config);
+
+    let server_handle = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        // Accept should fail — client won't negotiate TLS 1.3.
+        let _ = acceptor.accept(tcp).await;
+    });
+
+    // Client: TLS 1.2 only, with valid mTLS certs.
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.add(ca_cert_der).unwrap();
+
+    let client_config = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::ring::default_provider().into(),
+    )
+    .with_protocol_versions(&[&rustls::version::TLS12])
+    .unwrap()
+    .with_root_certificates(root_store)
+    .with_client_auth_cert(vec![client_cert], client_key)
+    .unwrap();
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+    // TLS handshake must fail — no overlapping protocol version.
+    let result = connector.connect(server_name, tcp).await;
+    assert!(
+        result.is_err(),
+        "TLS 1.2 client must be rejected by TLS 1.3-only server"
+    );
+
+    let _ = tokio::time::timeout(Duration::from_secs(3), server_handle).await;
 }
 
 /// Gate 3: connection without client cert is rejected (mTLS required).

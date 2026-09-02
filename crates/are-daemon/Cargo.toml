@@ -28,6 +28,7 @@ rcgen.workspace = true
 
 [dev-dependencies]
 are-client.workspace = true
+rustls = { workspace = true, features = ["tls12"] }
 rustls-webpki.workspace = true
 tokio.workspace = true
 time = "0.3"

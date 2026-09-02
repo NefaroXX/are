@@ -17,7 +17,7 @@ pub struct EnvironmentMetadata {
 ///
 /// An `Environment` represents a single remote machine or container that an
 /// agent can interact with. It carries identity, platform information,
-/// granted capabilities, and descriptive metadata.
+/// advertised capabilities, and descriptive metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Environment {
     /// Unique identifier for this environment.
@@ -26,8 +26,11 @@ pub struct Environment {
     pub name: String,
     /// Operating system / platform type.
     pub platform: Platform,
-    /// Capabilities granted on this environment.
-    pub capabilities: CapabilitySet,
+    /// Operations this environment advertises as available.
+    ///
+    /// This is NOT per-client authorization — all clients see the same set.
+    /// Per-client capability enforcement arrives in Gate 8.
+    pub advertised_capabilities: CapabilitySet,
     /// Additional metadata.
     pub metadata: EnvironmentMetadata,
 }
@@ -56,7 +59,7 @@ mod tests {
             id: EnvironmentId::new("test-env"),
             name: name.to_owned(),
             platform: Platform::Debian,
-            capabilities: CapabilitySet::from_iter([Capability::FilesystemRead]),
+            advertised_capabilities: CapabilitySet::from_iter([Capability::FilesystemRead]),
             metadata: EnvironmentMetadata {
                 created_at: "2026-01-01T00:00:00Z".into(),
                 version: "0.1.0".into(),

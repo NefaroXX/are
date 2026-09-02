@@ -21,7 +21,7 @@ Each ADR should include:
 
 1. **Title** — Short, descriptive name
 2. **Status** — Proposed, Accepted, Deprecated, Superseded
-3. **Context** — What situation necessitates a decision?
+3. **Context** — What situation necessitated a decision?
 4. **Decision** — What was decided and why?
 5. **Consequences** — What are the trade-offs?
 
@@ -32,6 +32,13 @@ NNN-short-title.md
 ```
 
 Where `NNN` is a zero-padded sequence number (e.g., `001-tls-transport.md`).
+
+## Index
+
+| ADR | Title | Status | Gate |
+|-----|-------|--------|------|
+| [001](001-wire-protocol-temporary.md) | Temporary Wire Protocol — Length-Prefixed JSON is Not the ARE Protocol Specification | Accepted | 3 |
+| [002](002-path-semantics.md) | Path Semantics — Environment-Relative, Not Absolute Host Paths | Accepted | 3.5 |
 
 ## Scope
 

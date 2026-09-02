@@ -145,7 +145,7 @@ async fn main() {
                     println!("  Platform:  {}", info.platform);
                     println!("  Version:   {}", info.daemon_version);
                     println!("  Capabilities:");
-                    for cap in info.capabilities.iter() {
+                    for cap in info.advertised_capabilities.iter() {
                         println!("    - {cap}");
                     }
                 }
@@ -197,7 +197,7 @@ async fn main() {
                     println!("  Platform:    {}", info.platform);
                     println!("  Version:     {}", info.daemon_version);
                     println!("  Capabilities:");
-                    for cap in info.capabilities.iter() {
+                    for cap in info.advertised_capabilities.iter() {
                         println!("    - {cap}");
                     }
                     println!();

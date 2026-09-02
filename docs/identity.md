@@ -1,20 +1,22 @@
 # ARE Identity Architecture
 
-**Gate 2 — 2026-09-01**
+**Gate 3 — 2026-09-01**
 
 ---
 
 ## Status
 
-This document defines the identity and trust model for ARE. It is **design and limited implementation** — no cryptographic libraries are added in Gate 2. The actual mTLS enforcement happens in Gate 3.
+This document defines the identity and trust model for ARE. It mixes **design** and **implementation** — the distinction matters and is marked explicitly below. Gate 3 implements TLS 1.3 mTLS (certificate validation + expiry via rustls/webpki) and the `GetEnvironmentInfo` RPC. Everything else described here — enrollment flow, revocation enforcement, credential rotation, capability-based authorization — is **designed only** and not enforced at runtime.
 
 ---
 
 ## 1. Machine Identity
 
+> **Implementation status:** `MachineIdentity` and `TrustAnchor` types are **implemented** as pure data shapes in `are-core`. Cryptographic enforcement (certificate generation, TLS handshake, trust validation) is implemented in Gate 3 via rustls/webpki.
+
 ### What Constitutes Identity
 
-Every ARE daemon and client possesses a **machine identity** consisting of:
+Every ARE daemon and client is **designed to possess** a machine identity consisting of:
 
 | Component | Description |
 |-----------|-------------|
@@ -98,6 +100,8 @@ Every credential has a defined lifetime and revocation path.
 ---
 
 ## 3. Enrollment Design
+
+> **Implementation status: DESIGNED — not implemented at runtime.** `EnrollmentCredential` struct exists in `are-core` as a data type, but no enrollment endpoint exists, no token issuance flow is wired, and no validation logic runs against a real token store.
 
 ### One-Time Enrollment Credential
 
@@ -197,6 +201,8 @@ This means compromising an enrollment token gives an attacker a one-time window,
 
 ## 4. Revocation
 
+> **Implementation status: DESIGNED — not enforced at runtime.** Gate 3 checks mTLS certificate validity and expiry via rustls/webpki. There is no CRL, no revocation list, no runtime revocation check, and no credential rotation logic. The revocation scenarios below describe intended Gate 3+ behavior, not current behavior.
+
 ### Revocation Scenarios
 
 | Scenario | Detection | Action | Recovery |
@@ -217,7 +223,7 @@ pub enum RevocationReason {
 }
 ```
 
-### Revocation Mechanisms (Gate 3+)
+### Revocation Mechanisms (designed, Gate 3+)
 
 | Mechanism | Scope | Implementation |
 |-----------|-------|---------------|
@@ -228,7 +234,9 @@ pub enum RevocationReason {
 
 ### Credential Rotation
 
-Rotation is the preferred response to compromise — not just revocation:
+> **Implementation status: DESIGNED — not implemented.** No rotation logic exists.
+
+Rotation is the **designed** preferred response to compromise — not just revocation:
 
 1. Revoke old credential (with reason: `Compromised`).
 2. Generate new keypair.
@@ -236,7 +244,7 @@ Rotation is the preferred response to compromise — not just revocation:
 4. Update daemon configuration.
 5. All clients must re-establish connections with new trust material.
 
-Gate 2 designs the rotation interface. Gate 3 implements the actual certificate lifecycle.
+Gate 2 designs the rotation interface. Gate 3 implements TLS certificate validation only. Automated rotation is deferred to a future gate.
 
 ---
 
@@ -305,13 +313,22 @@ Gate 2 designs the rotation interface. Gate 3 implements the actual certificate 
 - This architecture document.
 - Threat model updates.
 
+### What Gate 3 Adds (in addition to Gate 2)
+
+- `rustls`, `rcgen`, `webpki` dependencies for TLS 1.3 mTLS.
+- Certificate generation (self-signed for dev, CA-signed for prod).
+- mTLS handshake: both client and daemon present and validate certificates.
+- Trust anchor validation via rustls/webpki (expiry + chain validation).
+- `GetEnvironmentInfo` RPC over length-prefixed JSON framing.
+- **Not yet implemented:** enrollment flow, revocation enforcement, credential rotation, capability-based authorization.
+
 ---
 
 ## 7. Future Gate References
 
 | Gate | Scope | Relationship to Identity |
 |------|-------|------------------------|
-| **Gate 3** | Minimal secure connection (mTLS) | Implements TLS, certificate handling, trust validation |
+| **Gate 3** | Minimal secure connection (mTLS) | Implements TLS 1.3 mTLS, certificate handling, trust validation (complete: scoped to cert validation + GetEnvironmentInfo only; revocation/rotation/capability enforcement = designed) |
 | **Gate 8** | Capability-based authorization | Extends identity with per-environment capability scoping |
 | **Gate 11** | Reverse connection (relay) | Relay must not become trust anchor — end-to-end identity independent of relay |
 | **Gate 14** | Protocol stabilization | Identity protocol elements reviewed for standardization |

@@ -4,9 +4,9 @@
 //! TCP, or HTTP. They represent the domain-level data exchanged between
 //! client and daemon for environment metadata queries.
 //!
-//! The RPC envelope wraps typed request/response payloads with a correlation
-//! ID so the client can match responses to requests over a multiplexed or
-//! sequential connection.
+//! The RPC envelope wraps typed request/response payloads. Gate 3 uses a
+//! sequential one-request-per-connection model; correlation IDs are not
+//! needed and not included.
 
 use serde::{Deserialize, Serialize};
 
@@ -58,8 +58,11 @@ pub struct GetEnvironmentInfoResponse {
     pub operating_system: String,
     /// Daemon software version (crate version string).
     pub daemon_version: String,
-    /// Capabilities available on this environment.
-    pub capabilities: CapabilitySet,
+    /// Operations this environment advertises as available.
+    ///
+    /// This is NOT per-client authorization — all clients see the same set.
+    /// Per-client capability enforcement arrives in Gate 8.
+    pub advertised_capabilities: CapabilitySet,
     /// Platform type (Debian, Ubuntu, GenericLinux, etc.).
     pub platform: Platform,
 }
@@ -67,14 +70,6 @@ pub struct GetEnvironmentInfoResponse {
 // ---------------------------------------------------------------------------
 // RPC Envelope
 // ---------------------------------------------------------------------------
-
-/// Unique identifier for a request-response pair.
-///
-/// Correlation IDs are client-generated and echoed in the response so the
-/// client can match responses to requests. For Gate 3's sequential model
-/// this is technically redundant, but it establishes the convention early
-/// and costs nothing.
-pub type RequestId = u64;
 
 /// An RPC request wrapping a typed payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,8 +83,6 @@ pub enum RpcRequest {
 /// An RPC response wrapping a typed result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcResponse {
-    /// Correlation ID matching the request.
-    pub id: RequestId,
     /// The result payload, or an error.
     pub result: Result<RpcResponsePayload, RpcError>,
 }
@@ -162,7 +155,7 @@ mod tests {
             machine_name: "prod-01".into(),
             operating_system: "linux".into(),
             daemon_version: "0.1.0".into(),
-            capabilities: caps,
+            advertised_capabilities: caps,
             platform: Platform::Debian,
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -188,14 +181,13 @@ mod tests {
         caps.insert(crate::Capability::FilesystemRead);
 
         let resp = RpcResponse {
-            id: 42,
             result: Ok(RpcResponsePayload::GetEnvironmentInfo(
                 GetEnvironmentInfoResponse {
                     environment_id: EnvironmentId::new("dev"),
                     machine_name: "dev".into(),
                     operating_system: "linux".into(),
                     daemon_version: "0.1.0".into(),
-                    capabilities: caps,
+                    advertised_capabilities: caps,
                     platform: Platform::GenericLinux,
                 },
             )),

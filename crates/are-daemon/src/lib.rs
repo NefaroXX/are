@@ -78,20 +78,20 @@ pub fn build_daemon_state(config: &DaemonConfig) -> crate::handler::DaemonState 
     let operating_system = std::env::consts::OS.to_string();
     let platform = detect_platform(&operating_system);
 
-    let mut capabilities = CapabilitySet::default();
+    let mut advertised_capabilities = CapabilitySet::default();
     // Gate 3: mock all capabilities — no real filesystem or process ops yet.
-    capabilities.insert(are_core::Capability::FilesystemRead);
-    capabilities.insert(are_core::Capability::FilesystemWrite);
-    capabilities.insert(are_core::Capability::FilesystemList);
-    capabilities.insert(are_core::Capability::ProcessExecute);
-    capabilities.insert(are_core::Capability::ProcessInspect);
-    capabilities.insert(are_core::Capability::ProcessTerminate);
+    advertised_capabilities.insert(are_core::Capability::FilesystemRead);
+    advertised_capabilities.insert(are_core::Capability::FilesystemWrite);
+    advertised_capabilities.insert(are_core::Capability::FilesystemList);
+    advertised_capabilities.insert(are_core::Capability::ProcessExecute);
+    advertised_capabilities.insert(are_core::Capability::ProcessInspect);
+    advertised_capabilities.insert(are_core::Capability::ProcessTerminate);
 
     crate::handler::DaemonState::new(
         config.environment_id.clone(),
         machine_name,
         env!("CARGO_PKG_VERSION").to_string(),
-        capabilities,
+        advertised_capabilities,
         platform,
     )
 }
@@ -188,22 +188,22 @@ mod tests {
         let config = DaemonConfig::default();
         let state = build_daemon_state(&config);
         assert!(state
-            .capabilities
+            .advertised_capabilities
             .contains(&are_core::Capability::FilesystemRead));
         assert!(state
-            .capabilities
+            .advertised_capabilities
             .contains(&are_core::Capability::FilesystemWrite));
         assert!(state
-            .capabilities
+            .advertised_capabilities
             .contains(&are_core::Capability::FilesystemList));
         assert!(state
-            .capabilities
+            .advertised_capabilities
             .contains(&are_core::Capability::ProcessExecute));
         assert!(state
-            .capabilities
+            .advertised_capabilities
             .contains(&are_core::Capability::ProcessInspect));
         assert!(state
-            .capabilities
+            .advertised_capabilities
             .contains(&are_core::Capability::ProcessTerminate));
     }
 }

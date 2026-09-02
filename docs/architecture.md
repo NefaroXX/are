@@ -1,6 +1,6 @@
 # ARE Architecture
 
-**Gate 3 — 2026-09-01**
+**Gate 3.5 — 2026-09-01**
 
 ---
 
@@ -130,13 +130,15 @@ Each environment has a defined set of allowed roots (filesystem paths, capabilit
 
 ---
 
-## Security / Identity (Gate 2)
+## Security / Identity (Gate 2 + Gate 3)
 
 **Design document:** `docs/identity.md`
 
 ### Machine Identity
 
-Every daemon and client possesses a machine identity consisting of a keypair, an X.509 certificate, and a stable machine identifier. Private keys never leave the host and are never serialized. Public-facing identity is expressed as:
+> **Status: IMPLEMENTED.** `MachineIdentity` and `TrustAnchor` types are implemented in `are-core`. Certificate generation and mTLS handshake are implemented in Gate 3.
+
+Every daemon and client is **designed to possess** a machine identity consisting of a keypair, an X.509 certificate, and a stable machine identifier. Private keys never leave the host and are never serialized. Public-facing identity is expressed as:
 
 ```
 MachineIdentity {
@@ -148,30 +150,36 @@ MachineIdentity {
 
 ### Trust Model
 
+> **Status: IMPLEMENTED (mTLS only).** TLS 1.3 mutual authentication is implemented in Gate 3 via rustls/webpki. Revocation, capability enforcement, and rotation are designed only.
+
 - **Client ↔ Daemon:** Mutual TLS 1.3 (mTLS). Both sides present certificates and validate the peer.
 - **Trust anchors:** `SelfSigned` (development only) or `CaSigned` (production).
 - **No permanent shared secrets.** Every credential is revocable and time-limited.
 
 ### Enrollment
 
+> **Status: DESIGNED only.** `EnrollmentCredential` struct exists in `are-core`, but no enrollment endpoint or issuance flow is implemented.
+
 One-time enrollment credentials bootstrap new daemons. Properties: short-lived (< 1h), single-use, revocable, scoped to one environment + capability set. Enrollment credentials **never** become permanent machine credentials.
 
 ### Revocation
 
+> **Status: DESIGNED only.** Gate 3 checks mTLS certificate validity + expiry via rustls/webpki. There is no CRL, no revocation list, and no runtime revocation check. The scenarios below describe intended future behavior.
+
 Four revocation scenarios with documented detection → action → recovery:
 
-| Scenario | Action |
-|----------|--------|
-| Client credential revoked | Reject requests, terminate sessions |
-| Daemon credential revoked | Deny connections, invalidate sessions |
-| Environment disabled | Terminate all sessions, deny new requests |
-| Session terminated | Terminate processes, preserve state |
+| Scenario | Action | Status |
+|----------|--------|--------|
+| Client credential revoked | Reject requests, terminate sessions | DESIGNED |
+| Daemon credential revoked | Deny connections, invalidate sessions | DESIGNED |
+| Environment disabled | Terminate all sessions, deny new requests | DESIGNED |
+| Session terminated | Terminate processes, preserve state | DESIGNED |
 
 **See:** `docs/identity.md` §4 for full revocation matrix.
 
 ### Constraints
 
-- **No crypto in `are-core`.** Identity types are pure data shapes. Cryptographic enforcement (rustls, rcgen) arrives in Gate 3.
+- **No crypto in `are-core`.** Identity types are pure data shapes. Cryptographic enforcement (rustls, rcgen) is implemented in Gate 3.
 - **No custom cryptography.** Established libraries only (rustls, webpki, rcgen).
 
 ---
@@ -257,7 +265,8 @@ This architecture is the foundation (Gate 0). Future gates add capability increm
 | 0 | Repository and architecture foundation | ✓ Complete |
 | 1 | Environment domain model | ✓ Complete |
 | 2 | Security model and identity design | ✓ Complete |
-| 3 | Minimal secure connection (TLS 1.3 mTLS + GetEnvironmentInfo) | ✓ Complete |
+| 3 | Minimal secure connection (TLS 1.3 mTLS + GetEnvironmentInfo) | ✓ Complete (scoped: TLS 1.3 mTLS + GetEnvironmentInfo only; revocation/rotation/capability enforcement = designed) |
+| 3.5 | Boundary cleanup (implemented vs designed, ADRs, advertised_capabilities, path semantics) | ✓ Complete |
 | 4 | Read-only filesystem access | Pending |
 | 5 | Process execution (structured, no shell) | Pending |
 | 6 | Persistent agent sessions | Pending |

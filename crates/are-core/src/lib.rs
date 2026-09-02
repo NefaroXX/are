@@ -34,9 +34,12 @@ pub use identity::{
 };
 pub use ids::{EnvironmentId, ProcessId, SessionId};
 pub use info::{
-    GetEnvironmentInfoRequest, GetEnvironmentInfoResponse, RequestId, RpcError, RpcRequest,
-    RpcResponse, RpcResponsePayload,
+    GetEnvironmentInfoRequest, GetEnvironmentInfoResponse, RpcError, RpcRequest, RpcResponse,
+    RpcResponsePayload,
 };
 pub use platform::Platform;
-pub use request::*;
+pub use request::{
+    DirectoryEntry, FileMetadata, ListDirectoryRequest, ListDirectoryResponse, ReadFileRequest,
+    ReadFileResponse,
+};
 pub use traits::Environment as EnvironmentOps;

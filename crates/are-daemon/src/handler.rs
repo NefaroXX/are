@@ -18,8 +18,11 @@ pub struct DaemonState {
     pub machine_name: String,
     /// Daemon version string.
     pub daemon_version: String,
-    /// Capabilities available on this environment.
-    pub capabilities: CapabilitySet,
+    /// Operations this environment advertises as available.
+    ///
+    /// This is NOT per-client authorization — all clients see the same set.
+    /// Per-client capability enforcement arrives in Gate 8.
+    pub advertised_capabilities: CapabilitySet,
     /// Platform type.
     pub platform: Platform,
 }
@@ -30,27 +33,24 @@ impl DaemonState {
         environment_id: EnvironmentId,
         machine_name: String,
         daemon_version: String,
-        capabilities: CapabilitySet,
+        advertised_capabilities: CapabilitySet,
         platform: Platform,
     ) -> Self {
         Self {
             environment_id,
             machine_name,
             daemon_version,
-            capabilities,
+            advertised_capabilities,
             platform,
         }
     }
 
     /// Handle an RPC request and return a response.
     pub fn handle(&self, request: RpcRequest) -> RpcResponse {
-        // For now, all requests use id=0 since Gate 3 is sequential.
-        // The correlation ID will be meaningful when multiplexing is added.
         match request {
             RpcRequest::GetEnvironmentInfo(req) => {
                 let result = self.handle_get_environment_info(req);
                 RpcResponse {
-                    id: 0,
                     result: result.map(RpcResponsePayload::GetEnvironmentInfo),
                 }
             }
@@ -74,7 +74,7 @@ impl DaemonState {
             machine_name: self.machine_name.clone(),
             operating_system: std::env::consts::OS.to_string(),
             daemon_version: self.daemon_version.clone(),
-            capabilities: self.capabilities.clone(),
+            advertised_capabilities: self.advertised_capabilities.clone(),
             platform: self.platform.clone(),
         })
     }
@@ -113,15 +113,18 @@ mod tests {
         });
 
         let resp = state.handle(req);
-        assert_eq!(resp.id, 0);
         match resp.result {
             Ok(RpcResponsePayload::GetEnvironmentInfo(info)) => {
                 assert_eq!(info.environment_id.as_str(), "test-env");
                 assert_eq!(info.machine_name, "test-host");
                 assert_eq!(info.daemon_version, "0.1.0");
                 assert_eq!(info.platform, Platform::Debian);
-                assert!(info.capabilities.contains(&Capability::FilesystemRead));
-                assert!(info.capabilities.contains(&Capability::ProcessExecute));
+                assert!(info
+                    .advertised_capabilities
+                    .contains(&Capability::FilesystemRead));
+                assert!(info
+                    .advertised_capabilities
+                    .contains(&Capability::ProcessExecute));
             }
             other => panic!("expected Ok, got {other:?}"),
         }

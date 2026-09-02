@@ -3,13 +3,23 @@
 //! All types in this module are transport-independent: they carry no
 //! knowledge of SSH, TCP, TLS, or HTTP. Implementations map these to
 //! whatever wire format the transport uses.
+//!
+//! # Public API surface (Gate 3.5)
+//!
+//! Only `ReadFile` and `ListDirectory` are part of the stable public API.
+//! `WriteFile`, `Execute`, `ProcessStatus`, and `TerminateProcess` are
+//! gated behind `#[cfg(any(test, feature = "future"))]` and not re-exported
+//! from the crate root. They belong to future gates (5 and 7).
 
+#[cfg(any(test, feature = "future"))]
 use std::collections::HashMap;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{EnvironmentId, ProcessId};
+use crate::EnvironmentId;
+#[cfg(any(test, feature = "future"))]
+use crate::ProcessId;
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -41,6 +51,9 @@ pub struct DirectoryEntry {
 }
 
 /// Current state of a process.
+///
+/// **Not part of the public API.** Gated behind `feature = "future"`.
+#[cfg(any(test, feature = "future"))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessState {
@@ -61,7 +74,9 @@ pub enum ProcessState {
 pub struct ReadFileRequest {
     /// Target environment.
     pub environment_id: EnvironmentId,
-    /// Absolute or workspace-relative path.
+    /// Environment-relative path, resolved against the daemon's configured
+    /// allowed roots. Absolute host paths are rejected by default; see
+    /// `docs/decisions/002-path-semantics.md`.
     pub path: String,
 }
 
@@ -87,19 +102,26 @@ pub struct ReadFileResponse {
 }
 
 // ---------------------------------------------------------------------------
-// WriteFile
+// WriteFile (Future gate — not part of stable API)
 // ---------------------------------------------------------------------------
 
 /// Request to write a file to the environment.
+///
+/// **Not part of the public API.** Gated behind `feature = "future"`.
+/// Will become stable in Gate 5.
+#[cfg(any(test, feature = "future"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteFileRequest {
     pub environment_id: EnvironmentId,
+    /// Environment-relative path, resolved against allowed roots.
+    /// Must not escape the environment boundary.
     pub path: String,
     pub content: Vec<u8>,
     /// If `false`, fail when the file already exists.
     pub overwrite: bool,
 }
 
+#[cfg(any(test, feature = "future"))]
 impl WriteFileRequest {
     pub fn validate(&self) -> Result<(), crate::CoreError> {
         if self.path.is_empty() {
@@ -112,6 +134,9 @@ impl WriteFileRequest {
 }
 
 /// Response from writing a file.
+///
+/// **Not part of the public API.** Gated behind `feature = "future"`.
+#[cfg(any(test, feature = "future"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteFileResponse {
     pub metadata: FileMetadata,
@@ -125,6 +150,8 @@ pub struct WriteFileResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListDirectoryRequest {
     pub environment_id: EnvironmentId,
+    /// Environment-relative path, resolved against the daemon's configured
+    /// allowed roots. Absolute host paths are rejected by default.
     pub path: String,
 }
 
@@ -146,13 +173,17 @@ pub struct ListDirectoryResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Execute
+// Execute (Future gate — not part of stable API)
 // ---------------------------------------------------------------------------
 
 /// Request to execute a process in the environment.
 ///
 /// Uses structured execution (no shell string interpolation) per the
 /// project's non-negotiable design rules.
+///
+/// **Not part of the public API.** Gated behind `feature = "future"`.
+/// Will become stable in Gate 7.
+#[cfg(any(test, feature = "future"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecuteRequest {
     pub environment_id: EnvironmentId,
@@ -160,12 +191,14 @@ pub struct ExecuteRequest {
     pub program: String,
     /// Arguments to pass to the program.
     pub args: Vec<String>,
-    /// Working directory for the process.
+    /// Environment-relative working directory, resolved against allowed
+    /// roots. Must not escape the environment boundary.
     pub working_directory: String,
     /// Environment variables to set.
     pub env_vars: HashMap<String, String>,
 }
 
+#[cfg(any(test, feature = "future"))]
 impl ExecuteRequest {
     pub fn validate(&self) -> Result<(), crate::CoreError> {
         if self.program.is_empty() {
@@ -183,6 +216,9 @@ impl ExecuteRequest {
 }
 
 /// Response from executing a process.
+///
+/// **Not part of the public API.** Gated behind `feature = "future"`.
+#[cfg(any(test, feature = "future"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecuteResponse {
     /// Identifier of the created process.
@@ -190,10 +226,13 @@ pub struct ExecuteResponse {
 }
 
 // ---------------------------------------------------------------------------
-// ProcessStatus
+// ProcessStatus (Future gate — not part of stable API)
 // ---------------------------------------------------------------------------
 
 /// Request to query process status.
+///
+/// **Not part of the public API.** Gated behind `feature = "future"`.
+#[cfg(any(test, feature = "future"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessStatusRequest {
     pub environment_id: EnvironmentId,
@@ -201,16 +240,22 @@ pub struct ProcessStatusRequest {
 }
 
 /// Response containing process status.
+///
+/// **Not part of the public API.** Gated behind `feature = "future"`.
+#[cfg(any(test, feature = "future"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessStatusResponse {
     pub state: ProcessState,
 }
 
 // ---------------------------------------------------------------------------
-// TerminateProcess
+// TerminateProcess (Future gate — not part of stable API)
 // ---------------------------------------------------------------------------
 
 /// Request to terminate a process.
+///
+/// **Not part of the public API.** Gated behind `feature = "future"`.
+#[cfg(any(test, feature = "future"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminateProcessRequest {
     pub environment_id: EnvironmentId,
@@ -220,6 +265,9 @@ pub struct TerminateProcessRequest {
 }
 
 /// Response from terminating a process.
+///
+/// **Not part of the public API.** Gated behind `feature = "future"`.
+#[cfg(any(test, feature = "future"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminateProcessResponse {
     /// Whether the process was successfully terminated.

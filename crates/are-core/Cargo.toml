@@ -12,6 +12,11 @@ serde.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 
+[features]
+# Future gate: enables request types for WriteFile, Execute, ProcessStatus,
+# TerminateProcess. These are not part of the stable public API.
+future = []
+
 [dev-dependencies]
 serde_json.workspace = true
 

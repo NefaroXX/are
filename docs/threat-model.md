@@ -1,12 +1,12 @@
 # ARE Threat Model
 
-**Gate 2 — 2026-09-01**
+**Gate 3.5 — 2026-09-01**
 
 ---
 
 ## Status
 
-This is the initial threat model, authored at Gate 0. **No networking implementation exists yet.** Threats are identified and categorized; mitigations reference the gates where they will be implemented. This is an honest document — it states what is protected and what is not yet protected.
+This is the initial threat model, authored at Gate 0, updated through Gate 3. **Gate 3 implements TLS 1.3 mTLS and `GetEnvironmentInfo` RPC.** Revocation enforcement, credential rotation, capability-based authorization, and all other identity-layer enforcement remain **designed only** and are not enforced at runtime. This is an honest document — it states what is protected and what is not yet protected.
 
 ---
 
@@ -258,17 +258,19 @@ This is the initial threat model, authored at Gate 0. **No networking implementa
 
 ### Honest Assessment
 
-Gate 2 designs the identity architecture but **does not enforce it**. Specifically:
+Gate 2 designs the identity architecture. Gate 3 implements mTLS and GetEnvironmentInfo. Specifically:
 
 - ✅ Identity types defined (`MachineIdentity`, `EnrollmentCredential`, `TrustAnchor`, `RevocationReason`)
 - ✅ Trust model documented (mTLS, enrollment flow, revocation matrix)
 - ✅ Threat model updated with Gate 2 analysis
-- ❌ No TLS enforcement (Gate 3)
-- ❌ No capability enforcement (Gate 8)
-- ❌ No revocation list implementation (Gate 3+)
-- ❌ No enrollment endpoint (Gate 3+)
+- ✅ TLS 1.3 mTLS implemented (Gate 3) — client and daemon validate peer certificates via rustls/webpki
+- ✅ `GetEnvironmentInfo` RPC implemented (Gate 3)
+- ❌ No enrollment endpoint (designed only, no token issuance/validation)
+- ❌ No revocation list implementation (designed only)
+- ❌ No credential rotation (designed only)
+- ❌ No capability enforcement (designed only, Gate 8)
 
-**The identity design is sound but not yet enforced.** An attacker who ignores the identity layer faces no cryptographic barrier until Gate 3.
+**The identity design is sound.** Gate 3 provides transport-layer authentication and encryption. The revocation, rotation, and capability layers are designed but not yet enforced — an attacker who bypasses the identity layer faces no cryptographic barrier beyond mTLS cert validation.
 
 ---
 
@@ -331,7 +333,9 @@ Revocation is designed at Gate 2 (see `docs/identity.md` for full architecture).
 
 **Gate 2:** Identity architecture designed. Types implemented in `are-core`. Trust model, enrollment flow, and revocation matrix documented. **No cryptographic enforcement yet.**
 
-**Honest assessment:** Gate 2 provides design-level identity architecture. The types are implemented and tested, but no crypto libraries are added and no mTLS enforcement exists. An attacker who ignores the identity layer faces no cryptographic barrier until Gate 3.
+**Gate 3:** TLS 1.3 mTLS implemented (certificate validation + expiry via rustls/webpki). `GetEnvironmentInfo` RPC operational over length-prefixed JSON framing. **Not implemented:** enrollment flow, revocation enforcement, credential rotation, capability-based authorization (all designed only).
+
+**Honest assessment:** Gate 3 provides transport-layer security (encryption + mutual authentication). Identity types are implemented and tested. Revocation, rotation, and capability enforcement remain designed only — the identity layer beyond mTLS cert validation is not yet enforced at runtime.
 
 ---
 
