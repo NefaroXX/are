@@ -70,6 +70,34 @@ CI: fmt + clippy -D warnings + tests (140 tests total) — `.github/workflows/ci
 
 **STOP — do not start Gate 5 without explicit approval.** See `PLAN.md` §6 and STOP after Gate 4. Test against real VM/LXC and attempt deliberate filesystem escape attacks before proceeding.
 
+## Quick Start (Gate 4)
+
+```bash
+# Build
+cargo build
+
+# Start daemon (ephemeral certs — dev mode only, single-process)
+cargo run -p are-daemon -- listen --port 9000 --allowed-root ./test-workspace
+```
+
+For multi-process testing with the `are` CLI, generate file-based mTLS certs
+(see [docs/INSTALL.md](docs/INSTALL.md)):
+
+```bash
+# Generate certs (one-time)
+cd certs && openssl genrsa -out ca.key 4096 && openssl req -x509 -new -nodes -key ca.key -sha256 -days 365 -out ca.pem -subj "/CN=ARE Dev CA" && openssl genrsa -out server.key 4096 && openssl req -new -key server.key -out server.csr -subj "/CN=localhost" && openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out server.pem -days 365 -sha256 -extensions v3_req -extfile <(echo -e "[v3_req]\nsubjectAltName=DNS:localhost,IP:127.0.0.1") && openssl genrsa -out client.key 4096 && openssl req -new -key client.key -out client.csr -subj "/CN=are-client" && openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out client.pem -days 365 -sha256 && cd ..
+
+# Start daemon with certs
+./target/debug/ared listen --port 9000 --cert certs/server.pem --key certs/server.key --ca certs/ca.pem --allowed-root ./test-workspace
+
+# Connect from another terminal
+./target/debug/are connect --addr 127.0.0.1:9000 --cert certs/client.pem --key certs/client.key --ca certs/ca.pem
+```
+
+Full setup, all 8 filesystem security test scenarios, and troubleshooting:
+- **[docs/INSTALL.md](docs/INSTALL.md)** — prerequisites, cert generation, daemon/CLI usage
+- **[docs/TESTING.md](docs/TESTING.md)** — automated tests, manual verification, attack scenarios
+
 ---
 
 Private repo. Contact owner for access.

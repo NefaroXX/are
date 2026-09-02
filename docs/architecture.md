@@ -249,7 +249,10 @@ are/
 │   └── are-cli/            (CLI frontend)
 ├── docs/
 │   ├── architecture.md     (this file)
+│   ├── INSTALL.md          (installation & first-run guide)
+│   ├── TESTING.md          (testing guide, Gates 0–4)
 │   ├── threat-model.md     (threat model)
+│   ├── identity.md         (identity & mTLS design)
 │   └── decisions/          (ADR directory)
 └── tests/                  (integration tests)
 ```
