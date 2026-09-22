@@ -120,3 +120,39 @@ any fresh connection by id, with workdir + env traveling along; processes are
 bound to sessions; expiry and cascade behave exactly as documented. This is
 already a sharper tool than SSH for agent workflows — no shell quoting, no
 `cd` state to lose, no ambient authority.
+
+---
+
+# Gate 7 (Filesystem Writes) — same target, Gate 7 `ared` release build
+
+**Daemon:** rebuilt on-target with Gate 7 (atomic writes, blake3 hashes,
+`renameat2` NOREPLACE, typed errors), default allowlist plus write-capable
+client. Remote suite on target: **321 passed, 0 failed** (incl. unix-only
+write/symlink/concurrency tests). The Linux run additionally exposed 3
+`cfg(unix)`-only unused-variable warnings Windows never compiles — fixed in
+`fix(test) 651ce3a`; remote `clippy -D warnings` now clean.
+
+## Results
+
+| # | Scenario | Command / observation | Result |
+|---|----------|----------------------|--------|
+| 1 | mkdir + write + read + hash | `fs mkdir notes` → `fs write notes/agent-notes.txt` → `fs read` → `fs metadata` | ✅ `Wrote 11 bytes`, read-back identical, metadata hash `blake3:…` matches write receipt |
+| 2 | Overwrite + no-overwrite | rewrite same path (new hash) → `--no-overwrite` | ✅ replaced; refusal `conflict: file already exists`, exit 1 |
+| 3 | Optimistic concurrency | `metadata` hash → write with correct hash → write with stale hash | ✅ success then `conflict: file changed since read` (non-revealing), exit 1 |
+| 4 | Nested mkdir + rename + delete | `fs mkdir site/css` → `fs mv notes/agent-notes.txt notes/renamed.txt` (hash preserved across rename) → `fs rm` | ✅ all succeed |
+| 5 | Rename onto existing | `mv notes/renamed.txt file.txt` | ✅ `conflict: destination already exists`, exit 1 |
+| 6 | Non-empty delete | `fs rm subdir` | ✅ `conflict: directory not empty; recursive delete not supported`, contents intact |
+| 7 | Escapes (all four ops) | write `../evil.txt`, `mkdir /tmp/evil`, `mv file.txt ../out.txt`, `rm link_outside/passwd`, write `link_outside/evil.txt` | ✅ all fail closed (`escape blocked` / `absolute rejected`), exit 1 |
+| 8 | No strays / outside intact | root + `notes/` listings; `/tmp/evil` absent; `/etc/passwd` mtime unchanged | ✅ no `.are-tmp-*` strays; outside untouched |
+| 9 | Empty-dir delete | `rm notes`, `rm site/css`, `rm site` | ✅ all succeed; fixtures back to pristine |
+| 10 | Papercut fixes (live) | write to `newdir/nested/file.txt` (missing parent) → `not found` (was misleading `escape`); `--expect-hash` with verbatim `blake3:…` string from metadata | ✅ honest error, no regression on `../evil.txt`; prefixed hash accepted |
+
+Test dirs removed afterwards; `/home/projects/file.txt` restored to original
+content. Daemon left running (Gate 7 build, default timeouts, full allowlist).
+
+## Conclusion
+
+Agents can now create, read, modify, rename, and delete remotely with
+crash-safe atomicity and hash-based conflict detection — while every escape
+shape (traversal, absolute, symlink, nested symlink, cross-boundary rename)
+fails closed. The write surface is ready for capability scoping in Gate 8.
