@@ -91,6 +91,14 @@ enum Commands {
         action: ProcAction,
     },
 
+    /// Session operations on a remote environment (Gate 6: sessions are
+    /// first-class — create once, resume across reconnects by id)
+    Sess {
+        /// Subcommand: create, show, list, rm
+        #[command(subcommand)]
+        action: SessAction,
+    },
+
     /// Manage remote environments
     Env {
         /// Subcommand: list, add, remove
@@ -211,9 +219,45 @@ enum EnvAction {
 
 /// Shared TLS + addressing flags, flattened into each `proc` subcommand so
 /// every command carries the standard `--addr/--cert/--key/--ca/
-/// --server-name/--env-id` set like the `fs` commands.
+/// --server-name/--env-id/--session` set like the `fs` commands.
+///
+/// `--session` is REQUIRED (Gate 6): every process belongs to a session.
+/// Create one first with `are sess create`.
 #[derive(clap::Args)]
 struct ProcConn {
+    /// Server address (host:port)
+    #[arg(long, default_value = "127.0.0.1:9000")]
+    addr: String,
+
+    /// Path to client certificate PEM
+    #[arg(long)]
+    cert: PathBuf,
+
+    /// Path to client private key PEM
+    #[arg(long)]
+    key: PathBuf,
+
+    /// Path to CA certificate PEM
+    #[arg(long)]
+    ca: PathBuf,
+
+    /// Server hostname for SNI
+    #[arg(long, default_value = "localhost")]
+    server_name: String,
+
+    /// Environment ID
+    #[arg(long, default_value = "default")]
+    env_id: String,
+
+    /// Session ID (every process belongs to a session; see `are sess`)
+    #[arg(long)]
+    session: String,
+}
+
+/// Shared TLS + addressing flags for `sess` subcommands (no `--session`:
+/// these commands create or name the session).
+#[derive(clap::Args)]
+struct SessConn {
     /// Server address (host:port)
     #[arg(long, default_value = "127.0.0.1:9000")]
     addr: String,
@@ -240,6 +284,48 @@ struct ProcConn {
 }
 
 #[derive(Subcommand)]
+enum SessAction {
+    /// Create a persistent session (prints the session id)
+    Create {
+        #[command(flatten)]
+        conn: SessConn,
+
+        /// Environment-relative working directory (default ".")
+        #[arg(long, default_value = ".")]
+        workdir: String,
+
+        /// Environment variable KEY=VAL (repeatable; PATH is rejected,
+        /// LD_*/DYLD_* are stripped)
+        #[arg(long)]
+        env: Vec<String>,
+    },
+
+    /// Show (resume) a session by id
+    Show {
+        #[command(flatten)]
+        conn: SessConn,
+
+        /// Session ID
+        id: String,
+    },
+
+    /// List live sessions in the environment
+    List {
+        #[command(flatten)]
+        conn: SessConn,
+    },
+
+    /// Terminate a session, cascading to its processes
+    Rm {
+        #[command(flatten)]
+        conn: SessConn,
+
+        /// Session ID
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ProcAction {
     /// Start a process in the remote environment (structured, no shell)
     Run {
@@ -254,8 +340,10 @@ enum ProcAction {
         #[arg(long)]
         arg: Vec<String>,
 
-        /// Environment-relative working directory
-        #[arg(long, default_value = ".")]
+        /// Environment-relative working directory. Empty ("") inherits
+        /// the session's working directory (the default); a non-empty
+        /// value resolves env-relative per ADR-002.
+        #[arg(long, default_value = "")]
         workdir: String,
 
         /// Environment variable KEY=VAL (repeatable)
@@ -322,6 +410,17 @@ fn parse_process_id(id: &str) -> are_core::ProcessId {
     }
 }
 
+/// Parse a session id or exit with an error.
+fn parse_session_id(id: &str) -> are_core::SessionId {
+    match are_core::SessionId::try_new(id) {
+        Ok(sid) => sid,
+        Err(e) => {
+            eprintln!("error: invalid session id: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Build a TLS client or exit with an error.
 fn make_client(conn: &ProcConn) -> SecureClient {
     match SecureClient::from_pem_files(
@@ -337,6 +436,40 @@ fn make_client(conn: &ProcConn) -> SecureClient {
             std::process::exit(1);
         }
     }
+}
+
+/// Build a TLS client from session-command flags or exit with an error.
+fn make_sess_client(conn: &SessConn) -> SecureClient {
+    match SecureClient::from_pem_files(
+        &conn.cert,
+        &conn.key,
+        &conn.ca,
+        &conn.addr,
+        &conn.server_name,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: failed to configure TLS: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Parse KEY=VAL `--env` values or exit with an error.
+fn parse_env_vars(env: &[String]) -> std::collections::HashMap<String, String> {
+    let mut env_vars = std::collections::HashMap::new();
+    for kv in env {
+        match kv.split_once('=') {
+            Some((k, v)) if !k.is_empty() => {
+                env_vars.insert(k.to_string(), v.to_string());
+            }
+            _ => {
+                eprintln!("error: invalid --env value {kv:?} (expected KEY=VAL)");
+                std::process::exit(1);
+            }
+        }
+    }
+    env_vars
 }
 
 #[tokio::main]
@@ -605,23 +738,14 @@ async fn main() {
                 env,
             } => {
                 let env_id = parse_env_id(&conn.env_id);
+                let session_id = parse_session_id(&conn.session);
                 let client = make_client(&conn);
 
-                let mut env_vars = std::collections::HashMap::new();
-                for kv in &env {
-                    match kv.split_once('=') {
-                        Some((k, v)) if !k.is_empty() => {
-                            env_vars.insert(k.to_string(), v.to_string());
-                        }
-                        _ => {
-                            eprintln!("error: invalid --env value {kv:?} (expected KEY=VAL)");
-                            std::process::exit(1);
-                        }
-                    }
-                }
+                let env_vars = parse_env_vars(&env);
 
                 let req = are_core::ExecuteRequest {
                     environment_id: env_id,
+                    session_id,
                     program,
                     args: arg,
                     working_directory: workdir,
@@ -639,11 +763,13 @@ async fn main() {
 
             ProcAction::Status { conn, id } => {
                 let env_id = parse_env_id(&conn.env_id);
+                let session_id = parse_session_id(&conn.session);
                 let process_id = parse_process_id(&id);
                 let client = make_client(&conn);
 
                 let req = are_core::ProcessStatusRequest {
                     environment_id: env_id,
+                    session_id,
                     process_id,
                 };
 
@@ -658,11 +784,13 @@ async fn main() {
 
             ProcAction::Wait { conn, id, timeout } => {
                 let env_id = parse_env_id(&conn.env_id);
+                let session_id = parse_session_id(&conn.session);
                 let process_id = parse_process_id(&id);
                 let client = make_client(&conn);
 
                 let req = are_core::WaitProcessRequest {
                     environment_id: env_id,
+                    session_id,
                     process_id,
                     timeout_secs: timeout,
                 };
@@ -697,17 +825,123 @@ async fn main() {
 
             ProcAction::Kill { conn, id, force } => {
                 let env_id = parse_env_id(&conn.env_id);
+                let session_id = parse_session_id(&conn.session);
                 let process_id = parse_process_id(&id);
                 let client = make_client(&conn);
 
                 let req = are_core::TerminateProcessRequest {
                     environment_id: env_id,
+                    session_id,
                     process_id,
                     force,
                 };
 
                 match client.terminate_process(req).await {
                     Ok(resp) => println!("terminated: {}", resp.terminated),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
+
+        Commands::Sess { action } => match action {
+            SessAction::Create { conn, workdir, env } => {
+                let env_id = parse_env_id(&conn.env_id);
+                let client = make_sess_client(&conn);
+                let env_vars = parse_env_vars(&env);
+
+                let req = are_core::CreateSessionRequest {
+                    environment_id: env_id,
+                    working_directory: Some(workdir),
+                    env_vars,
+                };
+
+                match client.create_session(req).await {
+                    Ok(resp) => println!("{}", resp.session.session_id),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            SessAction::Show { conn, id } => {
+                let session_id = parse_session_id(&id);
+                let environment_id = parse_env_id(&conn.env_id);
+                let client = make_sess_client(&conn);
+
+                let req = are_core::GetSessionRequest {
+                    environment_id,
+                    session_id,
+                };
+
+                match client.get_session(req).await {
+                    Ok(resp) => {
+                        let s = resp.session;
+                        println!("session: {}", s.session_id);
+                        println!("  environment: {}", s.environment_id);
+                        println!("  workdir:     {}", s.working_directory);
+                        println!("  created:     {}", s.created_at);
+                        println!("  last-active: {}", s.last_activity);
+                        println!("  env:");
+                        let mut keys: Vec<&String> = s.env_vars.keys().collect();
+                        keys.sort();
+                        for k in keys {
+                            println!("    {k}={}", s.env_vars[k]);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            SessAction::List { conn } => {
+                let env_id = parse_env_id(&conn.env_id);
+                let client = make_sess_client(&conn);
+
+                let req = are_core::ListSessionsRequest {
+                    environment_id: env_id,
+                };
+
+                match client.list_sessions(req).await {
+                    Ok(resp) => {
+                        for s in &resp.sessions {
+                            println!(
+                                "{}  workdir={}  env_vars={}  created={}  last-active={}",
+                                s.session_id,
+                                s.working_directory,
+                                s.env_vars.len(),
+                                s.created_at,
+                                s.last_activity
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            SessAction::Rm { conn, id } => {
+                let session_id = parse_session_id(&id);
+                let environment_id = parse_env_id(&conn.env_id);
+                let client = make_sess_client(&conn);
+
+                let req = are_core::TerminateSessionRequest {
+                    environment_id,
+                    session_id,
+                };
+
+                match client.terminate_session(req).await {
+                    Ok(resp) => println!(
+                        "terminated session ({} processes reaped)",
+                        resp.terminated_processes
+                    ),
                     Err(e) => {
                         eprintln!("error: {e}");
                         std::process::exit(1);

@@ -24,10 +24,34 @@ use async_trait::async_trait;
 ///
 /// Only `write_file` remains gated behind `feature = "future"` (Gate 7).
 /// Process operations (`execute`, `process_status`, `terminate_process`,
-/// `wait_process`) are stable as of Gate 5.
+/// `wait_process`) are session-bound as of Gate 6: every process request
+/// carries a `session_id`, and session operations (`create_session`,
+/// `get_session`, `list_sessions`, `terminate_session`) manage the
+/// sessions processes belong to.
 #[async_trait]
 #[allow(dead_code)]
 pub trait Environment: Send + Sync {
+    /// Create a persistent session (working directory + env state).
+    async fn create_session(
+        &self,
+        req: CreateSessionRequest,
+    ) -> Result<CreateSessionResponse, CoreError>;
+
+    /// Fetch a session by id — the resume operation.
+    async fn get_session(&self, req: GetSessionRequest) -> Result<GetSessionResponse, CoreError>;
+
+    /// List live sessions in an environment.
+    async fn list_sessions(
+        &self,
+        req: ListSessionsRequest,
+    ) -> Result<ListSessionsResponse, CoreError>;
+
+    /// Terminate a session, cascading to its processes.
+    async fn terminate_session(
+        &self,
+        req: TerminateSessionRequest,
+    ) -> Result<TerminateSessionResponse, CoreError>;
+
     /// Read the contents of a file.
     async fn read_file(&self, req: ReadFileRequest) -> Result<ReadFileResponse, CoreError>;
 
@@ -75,13 +99,63 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use crate::ProcessId;
+    use crate::{EnvironmentId, ProcessId, SessionId, SessionInfo};
 
     /// Minimal mock that compiles the trait — proves it is implementable.
     struct MockEnvironment;
 
     #[async_trait]
     impl Environment for MockEnvironment {
+        async fn create_session(
+            &self,
+            _req: CreateSessionRequest,
+        ) -> Result<CreateSessionResponse, CoreError> {
+            Ok(CreateSessionResponse {
+                session: SessionInfo {
+                    session_id: SessionId::new("sess-mock"),
+                    environment_id: EnvironmentId::new("mock-env"),
+                    working_directory: ".".into(),
+                    env_vars: std::collections::HashMap::new(),
+                    created_at: 0,
+                    last_activity: 0,
+                    owner: None,
+                },
+            })
+        }
+
+        async fn get_session(
+            &self,
+            req: GetSessionRequest,
+        ) -> Result<GetSessionResponse, CoreError> {
+            Ok(GetSessionResponse {
+                session: SessionInfo {
+                    session_id: req.session_id,
+                    environment_id: EnvironmentId::new("mock-env"),
+                    working_directory: ".".into(),
+                    env_vars: std::collections::HashMap::new(),
+                    created_at: 0,
+                    last_activity: 0,
+                    owner: None,
+                },
+            })
+        }
+
+        async fn list_sessions(
+            &self,
+            _req: ListSessionsRequest,
+        ) -> Result<ListSessionsResponse, CoreError> {
+            Ok(ListSessionsResponse { sessions: vec![] })
+        }
+
+        async fn terminate_session(
+            &self,
+            _req: TerminateSessionRequest,
+        ) -> Result<TerminateSessionResponse, CoreError> {
+            Ok(TerminateSessionResponse {
+                terminated_processes: 0,
+            })
+        }
+
         async fn read_file(&self, _req: ReadFileRequest) -> Result<ReadFileResponse, CoreError> {
             Ok(ReadFileResponse {
                 content: b"mock".to_vec(),

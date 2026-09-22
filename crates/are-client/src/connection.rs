@@ -213,6 +213,64 @@ impl SecureClient {
         }
     }
 
+    /// Create a persistent session in the remote environment.
+    pub async fn create_session(
+        &self,
+        req: are_core::CreateSessionRequest,
+    ) -> Result<are_core::CreateSessionResponse, ConnectionError> {
+        let response = self.send_rpc(RpcRequest::CreateSession(req)).await?;
+
+        match response.result {
+            Ok(RpcResponsePayload::CreateSession(resp)) => Ok(resp),
+            Err(e) => Err(ConnectionError::RpcError(e.to_string())),
+            _ => Err(ConnectionError::UnexpectedResponse),
+        }
+    }
+
+    /// Fetch a session by id — the resume operation. Every RPC is a fresh
+    /// TLS connection, so "reconnect" needs no extra step: a new client
+    /// handle resuming by id proves persistence.
+    pub async fn get_session(
+        &self,
+        req: are_core::GetSessionRequest,
+    ) -> Result<are_core::GetSessionResponse, ConnectionError> {
+        let response = self.send_rpc(RpcRequest::GetSession(req)).await?;
+
+        match response.result {
+            Ok(RpcResponsePayload::GetSession(resp)) => Ok(resp),
+            Err(e) => Err(ConnectionError::RpcError(e.to_string())),
+            _ => Err(ConnectionError::UnexpectedResponse),
+        }
+    }
+
+    /// List live sessions in the remote environment.
+    pub async fn list_sessions(
+        &self,
+        req: are_core::ListSessionsRequest,
+    ) -> Result<are_core::ListSessionsResponse, ConnectionError> {
+        let response = self.send_rpc(RpcRequest::ListSessions(req)).await?;
+
+        match response.result {
+            Ok(RpcResponsePayload::ListSessions(resp)) => Ok(resp),
+            Err(e) => Err(ConnectionError::RpcError(e.to_string())),
+            _ => Err(ConnectionError::UnexpectedResponse),
+        }
+    }
+
+    /// Terminate a session, cascading to its processes.
+    pub async fn terminate_session(
+        &self,
+        req: are_core::TerminateSessionRequest,
+    ) -> Result<are_core::TerminateSessionResponse, ConnectionError> {
+        let response = self.send_rpc(RpcRequest::TerminateSession(req)).await?;
+
+        match response.result {
+            Ok(RpcResponsePayload::TerminateSession(resp)) => Ok(resp),
+            Err(e) => Err(ConnectionError::RpcError(e.to_string())),
+            _ => Err(ConnectionError::UnexpectedResponse),
+        }
+    }
+
     /// Send an RPC request and return the response.
     async fn send_rpc(&self, request: RpcRequest) -> Result<RpcResponse, ConnectionError> {
         // Establish TCP connection.

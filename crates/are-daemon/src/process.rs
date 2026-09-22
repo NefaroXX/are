@@ -1,4 +1,4 @@
-//! Secure structured process execution backend (Gate 5).
+//! Secure structured process execution backend (Gate 5, session-bound in Gate 6).
 //!
 //! This is the highest-risk feature implemented so far. The rules:
 //!
@@ -6,10 +6,21 @@
 //!   `execute_shell("arbitrary string")`. Programs are spawned directly via
 //!   `tokio::process::Command` with an explicit argv — shell metacharacters
 //!   in `program` or `args` are passed literally and never interpreted.
-//! - **Ownership: Environment → Session → Process.** Sessions do not exist
-//!   yet (Gate 6). Processes are keyed by `(environment_id, process_id)` in
-//!   daemon memory. The process table survives client disconnects (a new
-//!   connection can query by id) but NOT daemon restarts.
+//! - **Ownership: Environment → Session → Process.** Processes are keyed by
+//!   `(environment_id, session_id, process_id)` in daemon memory. A lookup
+//!   with the wrong session yields `NotFound`, indistinguishable from an
+//!   unknown process id — no oracle into other sessions. The process table
+//!   survives client disconnects (a new connection can query by id) but NOT
+//!   daemon restarts. Session liveness is checked by the handler BEFORE
+//!   every process operation (`touch`); the manager trusts the provided
+//!   [`SessionInfo`](are_core::SessionInfo) and records its id. RACE NOTE:
+//!   a session terminated between the handler's liveness check and `start`
+//!   leaves a process in a just-terminated session; that process is then
+//!   unreachable (its status/wait/terminate checks fail on the dead
+//!   session). If it already exited, its terminal entry ages out by
+//!   retention; if still live it survives until the next expiry sweep kills
+//!   it — benign and fail-closed, never silently leaked by an expiry path
+//!   that skips the kill.
 //! - **Executable policy (fail-closed).** Every spawn is checked against a
 //!   deny list (always enforced) and an allow list. When no allow list is
 //!   configured the manager refuses to spawn anything unless explicit
@@ -18,19 +29,23 @@
 //!   [`ProcessConfig::check_policy`]. KNOWN LIMITATION: basename matching
 //!   is bypassable by renamed copies and `PATH` shadowing; Gate 8 must do
 //!   canonical-path allowlisting (+hash pinning).
-//! - **Environment sanitization.** Request-supplied `PATH` is rejected
-//!   outright (programs resolve against the daemon's trusted `PATH`);
-//!   loader-influencing keys (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`,
-//!   and all `LD_*` / `DYLD_*` keys) are stripped from the child
-//!   environment. The child otherwise inherits the daemon's environment
-//!   (`env_clear()` is NOT applied); per-process env scoping arrives with
-//!   sessions (Gate 6).
-//! - **Working directory confinement.** The requested working directory is
-//!   resolved through the existing [`FilesystemBackend`](crate::fs::resolve),
-//!   reusing its boundary enforcement (traversal, symlink escape, TOCTOU
-//!   mitigation). It must exist and be a directory. Remote-facing errors
-//!   are generic (no canonical paths leak to clients); full paths appear
-//!   only in server-side `tracing` logs.
+//! - **Environment sanitization and merge.** Merge order is daemon
+//!   environment < session env < request env (request wins on conflicts).
+//!   Request- and session-supplied `PATH` are rejected outright (programs
+//!   resolve against the daemon's trusted `PATH`); loader-influencing keys
+//!   (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, and all `LD_*` / `DYLD_*`
+//!   keys) are stripped from the child environment at session creation AND
+//!   re-stripped at spawn merge (defense in depth). The child otherwise
+//!   inherits the daemon's environment (`env_clear()` is NOT applied).
+//! - **Working directory confinement + inheritance.** An empty request
+//!   workdir (`""`) inherits the session's working directory; a non-empty
+//!   one is resolved env-relative per ADR-002. Either way the effective
+//!   directory is resolved through the existing
+//!   [`FilesystemBackend`](crate::fs::resolve), reusing its boundary
+//!   enforcement (traversal, symlink escape, TOCTOU mitigation). It must
+//!   exist and be a directory. Remote-facing errors are generic (no
+//!   canonical paths leak to clients); full paths appear only in
+//!   server-side `tracing` logs.
 //! - **Bounded output.** Stdout/stderr are each capped at
 //!   `max_output_bytes` (default 8 MiB per stream). Excess bytes are
 //!   discarded and the `truncated` flag is set, so a verbose child cannot
@@ -39,12 +54,17 @@
 //!   clean `RpcError::InternalError`) is the backstop that keeps even two
 //!   full streams transmittable as a clean RPC error.
 //! - **Bounded process table.** At most `max_processes` entries (default
-//!   128) are retained. Spawning past the bound first evicts expired
-//!   terminal entries (older than `retention_secs`, default 1h), then the
-//!   oldest terminal entries; if every entry is still live the spawn is
-//!   refused with [`ProcessError::TooManyProcesses`]. Eviction drops the
-//!   table reference (and with it the retained output); in-flight waiters
-//!   holding an `Arc` still complete. Live entries are never evicted.
+//!   128) are retained, plus at most `max_processes_per_session` per
+//!   session (default 32, live + retained terminal). Spawning past the
+//!   global bound first evicts expired terminal entries (older than
+//!   `retention_secs`, default 1h), then the oldest terminal entries; if
+//!   every entry is still live the spawn is refused with
+//!   [`ProcessError::TooManyProcesses`]. Eviction drops the table reference
+//!   (and with it the retained output); in-flight waiters holding an `Arc`
+//!   still complete. Live entries are never evicted. Eviction stays GLOBAL
+//!   oldest-terminal-first: sessions share one pool (per-session retention
+//!   accounting is deferred — a busy session's terminal entries may evict
+//!   another session's).
 //! - **Bounded pipe drain.** After the child exits, pipes are drained for
 //!   at most `drain_timeout_secs` (default 5s): a detached descendant
 //!   holding stdout/stderr open cannot wedge the entry in `Running`
@@ -57,13 +77,13 @@
 //!   (signals). Both `force` values currently terminate forcefully —
 //!   documented, not silent.
 //! - **Terminate scope.** [`ProcessManager::terminate`] signals only the
-//!   direct child (no process-group kill); grandchildren survive. See the
-//!   method docs.
+//!   direct child (no process-group kill); grandchildren survive. Session
+//!   termination cascades with the same direct-children-only limitation. See
+//!   the method docs.
 //!
-//! Environment variables from the request are applied on top of the
-//! daemon's inherited environment (PATH lookup for bare program names
-//! requires it), minus the sanitized keys above. Per-process env scoping
-//! arrives with sessions (Gate 6).
+//! Environment variables from the session and the request are applied on top
+//! of the daemon's inherited environment (PATH lookup for bare program
+//! names requires it), minus the sanitized keys above.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -75,8 +95,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use are_core::{
     EnvironmentId, ExecuteRequest, ProcessId, ProcessState, ProcessStatusRequest,
-    ProcessStatusResponse, TerminateProcessRequest, TerminateProcessResponse, WaitProcessRequest,
-    WaitProcessResponse,
+    ProcessStatusResponse, SessionId, SessionInfo, TerminateProcessRequest,
+    TerminateProcessResponse, WaitProcessRequest, WaitProcessResponse,
 };
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStderr, ChildStdout};
@@ -184,6 +204,12 @@ pub struct ProcessConfig {
     /// entries are live the spawn fails with
     /// [`ProcessError::TooManyProcesses`].
     pub max_processes: usize,
+    /// Maximum retained entries per session (live + retained terminal).
+    /// A spawn that would exceed this for its session is refused with
+    /// [`ProcessError::TooManyProcesses`] even when the global table has
+    /// room. Defaults to
+    /// [`DEFAULT_MAX_PROCESSES_PER_SESSION`](crate::session::DEFAULT_MAX_PROCESSES_PER_SESSION).
+    pub max_processes_per_session: usize,
     /// Age in seconds after which a terminal entry becomes eligible for
     /// opportunistic eviction. Retained entries keep metadata plus the
     /// (already capped) output; eviction drops both.
@@ -206,6 +232,7 @@ impl Default for ProcessConfig {
                 .collect(),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             max_processes: DEFAULT_MAX_PROCESSES,
+            max_processes_per_session: crate::session::DEFAULT_MAX_PROCESSES_PER_SESSION,
             retention_secs: DEFAULT_RETENTION_SECS,
             drain_timeout_secs: DEFAULT_DRAIN_TIMEOUT_SECS,
         }
@@ -301,7 +328,7 @@ fn is_terminal(status: &ProcessState) -> bool {
     !matches!(status, ProcessState::Running)
 }
 
-/// Filter request-supplied environment variables for the child.
+/// Filter environment variables for the child.
 ///
 /// Removes dynamic-loader-influencing keys — exactly `LD_PRELOAD`,
 /// `LD_LIBRARY_PATH`, `LD_AUDIT`, plus any key starting with `LD_` or
@@ -311,7 +338,10 @@ fn is_terminal(status: &ProcessState) -> bool {
 /// client `PATH` would let callers redirect bare program names at
 /// attacker-controlled directories. Everything else passes through on top
 /// of the daemon's inherited environment.
-fn sanitize_env(env_vars: &HashMap<String, String>) -> HashMap<String, String> {
+///
+/// `pub(crate)` so session creation can apply the same filter to stored
+/// session env (the spawn merge re-applies it — defense in depth).
+pub(crate) fn sanitize_env(env_vars: &HashMap<String, String>) -> HashMap<String, String> {
     let mut out = HashMap::with_capacity(env_vars.len());
     let mut stripped = 0usize;
     for (key, value) in env_vars {
@@ -332,6 +362,25 @@ fn sanitize_env(env_vars: &HashMap<String, String>) -> HashMap<String, String> {
         );
     }
     out
+}
+
+/// Merge session env under request env (request wins on conflicts),
+/// then sanitize the union. `PATH` in either layer is a validation-time
+/// rejection, not a silent strip; loader keys are stripped here even
+/// though session creation stripped them too (defense in depth: stored
+/// session env is trusted-but-verified at every spawn).
+fn merge_session_env(
+    session_env: &HashMap<String, String>,
+    request_env: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut merged = HashMap::with_capacity(session_env.len() + request_env.len());
+    for (key, value) in session_env {
+        merged.insert(key.clone(), value.clone());
+    }
+    for (key, value) in request_env {
+        merged.insert(key.clone(), value.clone());
+    }
+    sanitize_env(&merged)
 }
 
 /// Allocate an unpredictable process id: `proc-` + 32 lowercase hex chars
@@ -369,8 +418,11 @@ struct ManagedState {
 }
 
 /// One entry in the process table.
+///
+/// Identity lives in the table key
+/// (`(environment_id, session_id, process_id)`), not in this struct — the
+/// entry holds only execution state.
 struct ProcessEntry {
-    environment_id: EnvironmentId,
     program: String,
     started_at: SystemTime,
     state: Mutex<ManagedState>,
@@ -383,18 +435,27 @@ struct ProcessEntry {
     notify: Notify,
 }
 
+/// Table key: `(environment_id, session_id, process_id)`. A lookup with a
+/// mismatched session misses exactly like an unknown process id — no
+/// oracle into other sessions' processes.
+type ProcessKey = (EnvironmentId, SessionId, ProcessId);
+
 // ---------------------------------------------------------------------------
 // ProcessManager
 // ---------------------------------------------------------------------------
 
-/// Owns the daemon's process table: `(environment_id, process_id)` keys.
+/// Owns the daemon's process table: `(environment_id, session_id,
+/// process_id)` keys.
 ///
 /// The table lives in daemon memory: it survives client disconnects (any
-/// new connection can query by id) but NOT daemon restarts. Gate 6 will
-/// bind processes to sessions; no session types are introduced here.
+/// new connection can query by id) but NOT daemon restarts. Every entry
+/// belongs to a session; session liveness is enforced by the handler before
+/// any operation reaches this manager.
+///
 /// Retention is bounded (see [`ProcessConfig::max_processes`]): eviction
 /// drops the table reference and the retained output with it, but waiters
-/// that already hold an `Arc` still complete normally.
+/// that already hold an `Arc` still complete normally. Eviction is global
+/// oldest-terminal-first across all sessions (shared pool).
 ///
 /// All locks are plain `std` mutexes held only for short critical sections
 /// (never across `.await`), so blocking handlers and async tasks can share
@@ -403,7 +464,7 @@ pub struct ProcessManager {
     environment_id: EnvironmentId,
     config: ProcessConfig,
     fs: Option<FilesystemBackend>,
-    processes: Mutex<HashMap<ProcessId, Arc<ProcessEntry>>>,
+    processes: Mutex<HashMap<ProcessKey, Arc<ProcessEntry>>>,
 }
 
 impl ProcessManager {
@@ -448,11 +509,24 @@ impl ProcessManager {
         self.processes.lock().map(|t| t.len()).unwrap_or(0)
     }
 
-    /// Start a process from a structured request.
+    /// Start a process from a structured request into a live session.
+    ///
+    /// `session` must be the live [`SessionInfo`](are_core::SessionInfo) the
+    /// handler just touched (liveness checked pre-call; see the module docs
+    /// for the benign TOCTOU note). `req.session_id` must match
+    /// `session.session_id` — a mismatch is a programmer error
+    /// (`Internal`), NOT a client oracle: cross-session lookups miss with
+    /// `NotFound` in `status`/`wait`/`terminate`, never with a distinctive
+    /// error.
     ///
     /// The program is spawned directly — never via a shell. See the module
-    /// docs for the full security contract.
-    pub async fn start(&self, req: ExecuteRequest) -> Result<ProcessId, ProcessError> {
+    /// docs for the full security contract (env merge order, workdir
+    /// inheritance, per-session cap).
+    pub async fn start(
+        &self,
+        req: ExecuteRequest,
+        session: &SessionInfo,
+    ) -> Result<ProcessId, ProcessError> {
         req.validate()
             .map_err(|e| ProcessError::InvalidRequest(e.to_string()))?;
         if req.environment_id != self.environment_id {
@@ -461,23 +535,42 @@ impl ProcessManager {
                 req.environment_id, self.environment_id
             )));
         }
+        if req.session_id != session.session_id {
+            return Err(ProcessError::Internal(
+                "session binding mismatch: touched session differs from request session".into(),
+            ));
+        }
+        if session.environment_id != self.environment_id {
+            return Err(ProcessError::Internal(
+                "session belongs to a different environment".into(),
+            ));
+        }
         self.config.check_policy(&req.program)?;
-        // Defense in depth: `ExecuteRequest::validate` already rejects
-        // `PATH`; refuse again here so a future validation change cannot
-        // silently re-open PATH redirection.
-        if req.env_vars.contains_key("PATH") {
+        // Defense in depth: validation already rejects `PATH` in both the
+        // request and session layers; refuse again here so a future
+        // validation change cannot silently re-open PATH redirection.
+        if req.env_vars.contains_key("PATH") || session.env_vars.contains_key("PATH") {
             return Err(ProcessError::InvalidRequest(
                 "env var PATH must not be supplied: programs resolve against the daemon's trusted PATH".into(),
             ));
         }
 
+        // Empty request workdir inherits the session's directory; either
+        // way the effective directory is resolved with boundary
+        // enforcement. The session workdir was validated at creation and is
+        // re-resolved here (no stale canonical paths cross the boundary).
+        let effective_workdir = if req.working_directory.is_empty() {
+            session.working_directory.clone()
+        } else {
+            req.working_directory.clone()
+        };
         let fs = self
             .fs
             .as_ref()
             .ok_or_else(|| ProcessError::Internal("filesystem backend not configured".into()))?;
         // Remote-facing workdir errors are generic: canonical paths must
         // not reach clients. Full detail goes to server-side logs.
-        let workdir: PathBuf = fs.resolve(&req.working_directory).map_err(|e| {
+        let workdir: PathBuf = fs.resolve(&effective_workdir).map_err(|e| {
             tracing::debug!("workdir resolve failed: {e}");
             match e {
                 FsError::FilesystemEscape(_) => ProcessError::InvalidRequest(
@@ -514,7 +607,10 @@ impl ProcessManager {
         let mut cmd = tokio::process::Command::new(&req.program);
         cmd.args(&req.args)
             .current_dir(&workdir)
-            .envs(sanitize_env(&req.env_vars))
+            // Merge order: daemon env (inherited) < session env < request
+            // env. Sanitized at every spawn (defense in depth over the
+            // session-creation strip).
+            .envs(merge_session_env(&session.env_vars, &req.env_vars))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -523,7 +619,6 @@ impl ProcessManager {
             .kill_on_drop(false);
 
         let entry = Arc::new(ProcessEntry {
-            environment_id: req.environment_id.clone(),
             program: req.program.clone(),
             started_at: SystemTime::now(),
             state: Mutex::new(ManagedState {
@@ -540,33 +635,59 @@ impl ProcessManager {
         // section: a full table refuses without orphaning a child, and
         // concurrent spawns cannot overshoot the bound between a separate
         // check and insert. `Command::spawn` is synchronous, so no `.await`
-        // happens while the table lock is held.
+        // happens while the table lock is held. Expired terminal entries
+        // are purged BEFORE the per-session cap check: retention reaping
+        // lives in `make_room_for_spawn`, so checking the cap first would
+        // dead-end a session that holds only retention-expired terminals
+        // (spawn refused forever, reaping never reached). Then the global
+        // bound applies with oldest-terminal eviction.
         let id = {
             let mut table = self
                 .processes
                 .lock()
                 .map_err(|_| ProcessError::Internal("process table poisoned".into()))?;
+            evict_expired_terminal_entries(&mut table, self.config.retention_secs);
+            let session_count = table
+                .keys()
+                .filter(|(env, sess, _)| *env == req.environment_id && *sess == req.session_id)
+                .count();
+            if session_count >= self.config.max_processes_per_session {
+                return Err(ProcessError::TooManyProcesses(format!(
+                    "session '{}' holds {} processes (cap {}): refusing spawn",
+                    req.session_id, session_count, self.config.max_processes_per_session
+                )));
+            }
             make_room_for_spawn(&mut table, &self.config)?;
-            let mut chosen = None;
+            let mut chosen: Option<ProcessKey> = None;
             for _ in 0..8 {
                 let candidate = alloc_process_id()?;
-                if !table.contains_key(&candidate) {
-                    chosen = Some(candidate);
+                let candidate_key = (
+                    req.environment_id.clone(),
+                    req.session_id.clone(),
+                    candidate,
+                );
+                if !table.contains_key(&candidate_key) {
+                    chosen = Some(candidate_key);
                     break;
                 }
             }
-            let id = chosen.ok_or_else(|| {
+            let chosen_key = chosen.ok_or_else(|| {
                 ProcessError::Internal("repeated process id collisions; refusing spawn".into())
             })?;
-            table.insert(id.clone(), Arc::clone(&entry));
-            id
+            let pid = chosen_key.2.clone();
+            table.insert(chosen_key, Arc::clone(&entry));
+            pid
         };
 
         let mut child = cmd.spawn().map_err(|e| {
             // Spawn failed after reservation: release the slot so a failed
             // spawn does not consume table capacity.
             if let Ok(mut table) = self.processes.lock() {
-                table.remove(&id);
+                table.remove(&(
+                    req.environment_id.clone(),
+                    req.session_id.clone(),
+                    id.clone(),
+                ));
             }
             ProcessError::Internal(format!("failed to spawn {:?}: {e}", req.program))
         })?;
@@ -592,11 +713,14 @@ impl ProcessManager {
     }
 
     /// Query the current status of a process (never blocks).
+    ///
+    /// Lookup key is `(environment_id, session_id, process_id)`: a session
+    /// mismatch misses exactly like an unknown id (`NotFound` — no oracle).
     pub fn status(
         &self,
         req: &ProcessStatusRequest,
     ) -> Result<ProcessStatusResponse, ProcessError> {
-        let entry = self.lookup(&req.environment_id, &req.process_id)?;
+        let entry = self.lookup(&req.environment_id, &req.session_id, &req.process_id)?;
         let guard = entry
             .state
             .lock()
@@ -621,7 +745,7 @@ impl ProcessManager {
     pub async fn wait(&self, req: WaitProcessRequest) -> Result<WaitProcessResponse, ProcessError> {
         req.validate()
             .map_err(|e| ProcessError::InvalidRequest(e.to_string()))?;
-        let entry = self.lookup(&req.environment_id, &req.process_id)?;
+        let entry = self.lookup(&req.environment_id, &req.session_id, &req.process_id)?;
         let deadline = Instant::now() + Duration::from_secs(req.timeout_secs);
         loop {
             // One short critical section. Buffers are cloned only on a
@@ -691,7 +815,7 @@ impl ProcessManager {
         &self,
         req: TerminateProcessRequest,
     ) -> Result<TerminateProcessResponse, ProcessError> {
-        let entry = self.lookup(&req.environment_id, &req.process_id)?;
+        let entry = self.lookup(&req.environment_id, &req.session_id, &req.process_id)?;
         {
             let guard = entry
                 .state
@@ -731,10 +855,13 @@ impl ProcessManager {
         Ok(TerminateProcessResponse { terminated: true })
     }
 
-    /// Look up a process, enforcing the environment binding.
+    /// Look up a process by its full `(environment_id, session_id,
+    /// process_id)` key. Any miss — unknown id OR session mismatch — yields
+    /// `NotFound` with no distinction (no oracle into other sessions).
     fn lookup(
         &self,
         environment_id: &EnvironmentId,
+        session_id: &SessionId,
         process_id: &ProcessId,
     ) -> Result<Arc<ProcessEntry>, ProcessError> {
         let table = self
@@ -742,14 +869,73 @@ impl ProcessManager {
             .lock()
             .map_err(|_| ProcessError::Internal("process table poisoned".into()))?;
         let entry = table
-            .get(process_id)
+            .get(&(
+                environment_id.clone(),
+                session_id.clone(),
+                process_id.clone(),
+            ))
             .ok_or_else(|| ProcessError::NotFound(format!("unknown process id '{process_id}'")))?;
-        if entry.environment_id != *environment_id {
-            return Err(ProcessError::EnvironmentMismatch(format!(
-                "process '{process_id}' does not belong to environment '{environment_id}'"
-            )));
-        }
         Ok(Arc::clone(entry))
+    }
+
+    /// Number of table entries (live + retained terminal) belonging to one
+    /// session. Used by tests and the per-session spawn cap path.
+    pub fn count_for_session(&self, session_id: &SessionId) -> usize {
+        self.processes
+            .lock()
+            .map(|table| {
+                table
+                    .keys()
+                    .filter(|(_, sess, _)| *sess == *session_id)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Best-effort kill of every LIVE process in a session
+    /// (session-termination / session-expiry cascade). Sets the kill flag on
+    /// each `Running` session entry and returns how many live kills were
+    /// issued — already-terminal entries are neither signaled nor counted
+    /// (counts live kills only). Only direct children are signaled (no
+    /// process-group kill; grandchildren survive — the inherited Gate 5
+    /// limitation). The supervisor tasks own the actual kills and reap
+    /// imminently; terminal entries age out by retention.
+    pub fn kill_session_processes(
+        &self,
+        environment_id: &EnvironmentId,
+        session_id: &SessionId,
+    ) -> usize {
+        let targets: Vec<Arc<ProcessEntry>> = self
+            .processes
+            .lock()
+            .map(|table| {
+                table
+                    .iter()
+                    .filter(|((env, sess, _), _)| *env == *environment_id && *sess == *session_id)
+                    .map(|(_, entry)| Arc::clone(entry))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut count = 0usize;
+        for entry in targets {
+            let running = entry
+                .state
+                .lock()
+                .map(|guard| guard.status == ProcessState::Running)
+                .unwrap_or(false);
+            if running {
+                entry.kill_requested.store(true, Ordering::SeqCst);
+                count += 1;
+            }
+        }
+        if count > 0 {
+            tracing::info!(
+                session_id = %session_id,
+                processes = count,
+                "session cascade: kill requested for session processes"
+            );
+        }
+        count
     }
 }
 
@@ -762,7 +948,7 @@ impl ProcessManager {
 /// (callers already holding an `Arc` — e.g. an in-flight `wait()` — still
 /// complete normally).
 fn make_room_for_spawn(
-    table: &mut HashMap<ProcessId, Arc<ProcessEntry>>,
+    table: &mut HashMap<ProcessKey, Arc<ProcessEntry>>,
     config: &ProcessConfig,
 ) -> Result<(), ProcessError> {
     evict_expired_terminal_entries(table, config.retention_secs);
@@ -781,11 +967,11 @@ fn make_room_for_spawn(
 
 /// Drop terminal entries whose final state is older than `retention_secs`.
 fn evict_expired_terminal_entries(
-    table: &mut HashMap<ProcessId, Arc<ProcessEntry>>,
+    table: &mut HashMap<ProcessKey, Arc<ProcessEntry>>,
     retention_secs: u64,
 ) {
     let now = SystemTime::now();
-    let expired: Vec<ProcessId> = table
+    let expired: Vec<ProcessKey> = table
         .iter()
         .filter_map(|(id, entry)| {
             let guard = entry.state.lock().ok()?;
@@ -809,10 +995,10 @@ fn evict_expired_terminal_entries(
 /// Drop the oldest terminal entries until `len < max`. Live entries are
 /// never candidates, even if they are the oldest in the table.
 fn evict_oldest_terminal_entries(
-    table: &mut HashMap<ProcessId, Arc<ProcessEntry>>,
+    table: &mut HashMap<ProcessKey, Arc<ProcessEntry>>,
     max_processes: usize,
 ) {
-    let mut terminal: Vec<(SystemTime, ProcessId)> = table
+    let mut terminal: Vec<(SystemTime, ProcessKey)> = table
         .iter()
         .filter_map(|(id, entry)| {
             let guard = entry.state.lock().ok()?;
@@ -1002,9 +1188,20 @@ mod tests {
 
     use super::*;
 
+    fn test_session() -> SessionId {
+        SessionId::new("sess-test")
+    }
+
+    fn test_key(pid: &str) -> ProcessKey {
+        (
+            EnvironmentId::new("test-env"),
+            test_session(),
+            ProcessId::new(pid),
+        )
+    }
+
     fn running_entry() -> Arc<ProcessEntry> {
         Arc::new(ProcessEntry {
-            environment_id: EnvironmentId::new("test-env"),
             program: "test".into(),
             started_at: SystemTime::now(),
             state: Mutex::new(ManagedState {
@@ -1021,7 +1218,6 @@ mod tests {
 
     fn terminal_entry(age_secs: u64) -> Arc<ProcessEntry> {
         Arc::new(ProcessEntry {
-            environment_id: EnvironmentId::new("test-env"),
             program: "test".into(),
             started_at: SystemTime::now(),
             state: Mutex::new(ManagedState {
@@ -1037,8 +1233,8 @@ mod tests {
     }
 
     fn table_with(
-        entries: Vec<(ProcessId, Arc<ProcessEntry>)>,
-    ) -> HashMap<ProcessId, Arc<ProcessEntry>> {
+        entries: Vec<(ProcessKey, Arc<ProcessEntry>)>,
+    ) -> HashMap<ProcessKey, Arc<ProcessEntry>> {
         entries.into_iter().collect()
     }
 
@@ -1183,30 +1379,30 @@ mod tests {
     #[test]
     fn expired_terminal_entries_are_evictable() {
         let mut table = table_with(vec![
-            (ProcessId::new("proc-old"), terminal_entry(7200)),
-            (ProcessId::new("proc-fresh"), terminal_entry(10)),
-            (ProcessId::new("proc-live"), running_entry()),
+            (test_key("proc-old"), terminal_entry(7200)),
+            (test_key("proc-fresh"), terminal_entry(10)),
+            (test_key("proc-live"), running_entry()),
         ]);
         evict_expired_terminal_entries(&mut table, 3600);
-        assert!(!table.contains_key(&ProcessId::new("proc-old")));
-        assert!(table.contains_key(&ProcessId::new("proc-fresh")));
-        assert!(table.contains_key(&ProcessId::new("proc-live")));
+        assert!(!table.contains_key(&test_key("proc-old")));
+        assert!(table.contains_key(&test_key("proc-fresh")));
+        assert!(table.contains_key(&test_key("proc-live")));
     }
 
     #[test]
     fn oldest_terminal_evicted_first_and_live_never() {
         let mut table = table_with(vec![
-            (ProcessId::new("proc-old"), terminal_entry(100)),
-            (ProcessId::new("proc-new"), terminal_entry(10)),
-            (ProcessId::new("proc-live"), running_entry()),
+            (test_key("proc-old"), terminal_entry(100)),
+            (test_key("proc-new"), terminal_entry(10)),
+            (test_key("proc-live"), running_entry()),
         ]);
         // Full table (3 entries, max=3): must drop exactly one terminal
         // entry — the oldest — to make room for a single new spawn.
         evict_oldest_terminal_entries(&mut table, 3);
         assert_eq!(table.len(), 2);
-        assert!(!table.contains_key(&ProcessId::new("proc-old")));
-        assert!(table.contains_key(&ProcessId::new("proc-new")));
-        assert!(table.contains_key(&ProcessId::new("proc-live")));
+        assert!(!table.contains_key(&test_key("proc-old")));
+        assert!(table.contains_key(&test_key("proc-new")));
+        assert!(table.contains_key(&test_key("proc-live")));
     }
 
     #[test]
@@ -1216,8 +1412,8 @@ mod tests {
             ..ProcessConfig::default()
         };
         let mut table = table_with(vec![
-            (ProcessId::new("proc-a"), running_entry()),
-            (ProcessId::new("proc-b"), running_entry()),
+            (test_key("proc-a"), running_entry()),
+            (test_key("proc-b"), running_entry()),
         ]);
         let err = make_room_for_spawn(&mut table, &config).unwrap_err();
         assert!(matches!(err, ProcessError::TooManyProcesses(_)));
@@ -1251,6 +1447,10 @@ mod tests {
         assert_eq!(config.max_processes, DEFAULT_MAX_PROCESSES);
         assert_eq!(config.retention_secs, DEFAULT_RETENTION_SECS);
         assert_eq!(config.drain_timeout_secs, DEFAULT_DRAIN_TIMEOUT_SECS);
+        assert_eq!(
+            config.max_processes_per_session,
+            crate::session::DEFAULT_MAX_PROCESSES_PER_SESSION
+        );
     }
 
     #[tokio::test]

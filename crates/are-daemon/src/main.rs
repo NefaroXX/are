@@ -80,6 +80,27 @@ enum Commands {
         /// binaries. Logs a loud warning at startup and per spawn.
         #[arg(long)]
         permissive_exec: bool,
+
+        /// Session idle timeout in seconds: a session untouched for longer
+        /// is expired on next access (lazy expiry, no background reaper).
+        #[arg(long, default_value = "3600")]
+        session_idle_timeout: u64,
+
+        /// Session maximum lifetime in seconds since creation, regardless
+        /// of activity.
+        #[arg(long, default_value = "86400")]
+        session_max_lifetime: u64,
+
+        /// Maximum live sessions. Creation past this bound purges expired
+        /// entries first, then refuses with an error.
+        #[arg(long, default_value = "64")]
+        max_sessions: usize,
+
+        /// Maximum processes per session (live + retained terminal).
+        /// Copied into both the session and process configs (single source
+        /// of truth is the daemon config). Default 32.
+        #[arg(long, default_value = "32")]
+        max_processes_per_session: usize,
     },
 }
 
@@ -106,6 +127,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             allowed_root,
             allow_exec,
             permissive_exec,
+            session_idle_timeout,
+            session_max_lifetime,
+            max_sessions,
+            max_processes_per_session,
         } => {
             let env_id = EnvironmentId::try_new(&environment_id)
                 .map_err(|e| format!("invalid environment_id: {e}"))?;
@@ -136,7 +161,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = DaemonConfig {
                 environment_id: env_id,
                 port,
-                max_sessions: 64,
+                max_sessions,
+                max_processes_per_session: Some(max_processes_per_session),
+                session_idle_timeout_secs: session_idle_timeout,
+                session_max_lifetime_secs: session_max_lifetime,
                 server_cert_path: cert.as_ref().map(|p| p.display().to_string()),
                 server_key_path: key.as_ref().map(|p| p.display().to_string()),
                 client_ca_path: ca.as_ref().map(|p| p.display().to_string()),

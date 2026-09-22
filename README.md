@@ -1,10 +1,10 @@
 # ARE — Agent Remote Environment
 
-> **Status: Gate 5 complete — secure structured process execution (no shell, allow/deny policy fail-closed, output caps, wait/terminate). STOP for review before Gate 6. Do not use.**
+> **Status: Gate 6 complete — persistent agent sessions (create/resume/list/terminate, idle+lifetime expiry, session-bound processes + workdir/env). STOP for review before Gate 7. Do not use.**
 
 ARE is a secure, agent-oriented remote environment system that lets AI coding agents operate on remote Linux machines as if those machines are their primary execution environment.
 
-This repo is currently **private** while the gated implementation proceeds. See `PLAN.md` for the full 14-gate plan (Gates 0–14, strict STOP gates). Gates 0–5 are complete and awaiting STOP review.
+This repo is currently **private** while the gated implementation proceeds. See `PLAN.md` for the full 14-gate plan (Gates 0–14, strict STOP gates). Gates 0–6 are complete and awaiting STOP review.
 
 ## Working Names
 
@@ -28,7 +28,8 @@ Targets: LXC containers, VMs, remote Linux servers (Debian/Ubuntu/Proxmox LXC), 
 3. Minimal Secure Connection ✓ complete (TLS 1.3 mTLS + GetEnvironmentInfo)
 3.5 Boundary Cleanup ✓ complete (implemented vs designed, ADR-001/002, advertised_capabilities, RpcResponse.id removed, TLS 1.2 test, env-relative paths, future API gated)
 4. Read-Only Filesystem ✓ complete (env-relative, allowed roots, canonicalization + symlink/escape/TOCTOU, file_metadata, 16 MiB cap, advertised read+list)
-5. Process Execution ← **we are here** ✓ complete (structured, no shell, deny-wins + fail-closed allowlist, 8 MiB output caps, wait/terminate, CSPRNG ids)
+5. Process Execution ✓ complete (structured, no shell, deny-wins + fail-closed allowlist, 8 MiB output caps, wait/terminate, CSPRNG ids)
+6. Persistent Agent Sessions ← **we are here** ✓ complete (create/resume/list/terminate, idle 3600s + lifetime 86400s expiry, session-bound procs, workdir inherit, session env, kill-on-expiry)
 4. Read-Only Filesystem
 5. Process Execution (structured, no shell)
 6. Persistent Agent Sessions

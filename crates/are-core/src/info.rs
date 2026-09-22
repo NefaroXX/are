@@ -11,10 +11,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CapabilitySet, CoreError, EnvironmentId, ExecuteRequest, ExecuteResponse,
-    GetFileMetadataRequest, GetFileMetadataResponse, ListDirectoryRequest, ListDirectoryResponse,
-    Platform, ProcessStatusRequest, ProcessStatusResponse, ReadFileRequest, ReadFileResponse,
-    TerminateProcessRequest, TerminateProcessResponse, WaitProcessRequest, WaitProcessResponse,
+    CapabilitySet, CoreError, CreateSessionRequest, CreateSessionResponse, EnvironmentId,
+    ExecuteRequest, ExecuteResponse, GetFileMetadataRequest, GetFileMetadataResponse,
+    GetSessionRequest, GetSessionResponse, ListDirectoryRequest, ListDirectoryResponse,
+    ListSessionsRequest, ListSessionsResponse, Platform, ProcessStatusRequest,
+    ProcessStatusResponse, ReadFileRequest, ReadFileResponse, TerminateProcessRequest,
+    TerminateProcessResponse, TerminateSessionRequest, TerminateSessionResponse,
+    WaitProcessRequest, WaitProcessResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -104,6 +107,18 @@ pub enum RpcRequest {
     /// Wait for a process to exit, up to a timeout.
     #[serde(rename = "wait_process")]
     WaitProcess(WaitProcessRequest),
+    /// Create a persistent session.
+    #[serde(rename = "create_session")]
+    CreateSession(CreateSessionRequest),
+    /// Fetch a session by id (the resume operation).
+    #[serde(rename = "get_session")]
+    GetSession(GetSessionRequest),
+    /// List live sessions in an environment.
+    #[serde(rename = "list_sessions")]
+    ListSessions(ListSessionsRequest),
+    /// Terminate a session, cascading to its processes.
+    #[serde(rename = "terminate_session")]
+    TerminateSession(TerminateSessionRequest),
 }
 
 /// An RPC response wrapping a typed result.
@@ -141,6 +156,18 @@ pub enum RpcResponsePayload {
     /// Process wait response (capped captured output).
     #[serde(rename = "wait_process")]
     WaitProcess(WaitProcessResponse),
+    /// Session creation response.
+    #[serde(rename = "create_session")]
+    CreateSession(CreateSessionResponse),
+    /// Session resume response.
+    #[serde(rename = "get_session")]
+    GetSession(GetSessionResponse),
+    /// Session listing response.
+    #[serde(rename = "list_sessions")]
+    ListSessions(ListSessionsResponse),
+    /// Session termination response.
+    #[serde(rename = "terminate_session")]
+    TerminateSession(TerminateSessionResponse),
 }
 
 /// RPC-level error, distinct from `CoreError` (which is domain-level).
@@ -169,6 +196,32 @@ pub enum RpcError {
     /// rejection from malformed requests.
     #[error("executable denied by policy: {0}")]
     DeniedExecutable(String),
+
+    /// The requested session id is unknown (never existed or already
+    /// terminated). Distinct from `NotFound` so resume logic can tell "no
+    /// such session" apart from "session aged out" (`SessionExpired`) and
+    /// from unknown processes (`NotFound`).
+    #[error("session not found: {0}")]
+    SessionNotFound(String),
+
+    /// The requested session id existed but expired (idle timeout or
+    /// maximum lifetime exceeded). The entry has been removed; the client
+    /// must create a new session. Distinct from `SessionNotFound` so
+    /// clients can report "resume failed: expired" vs "never existed".
+    ///
+    /// KNOWN LEAK (documented, Gate 8 must fix): returning `SessionExpired`
+    /// vs `SessionNotFound` lets any client confirm an id was once live
+    /// (an expiry oracle). Gate 8 must return generic `NotFound` to
+    /// non-owners once `SessionInfo.owner` is bound to the client-cert
+    /// identity, and add a cross-client indistinguishability test.
+    #[error("session expired: {0}")]
+    SessionExpired(String),
+
+    /// A bounded table refused the operation (too many sessions or too many
+    /// processes). Distinct from `InternalError` so clients can distinguish
+    /// "retry after reaping/expiry" from daemon failures.
+    #[error("capacity exceeded: {0}")]
+    CapacityExceeded(String),
 
     /// An internal daemon error occurred.
     #[error("internal error: {0}")]
@@ -270,11 +323,24 @@ mod tests {
         for err in [
             RpcError::NotFound("proc-1".into()),
             RpcError::DeniedExecutable("shutdown".into()),
+            RpcError::SessionNotFound("sess-9".into()),
+            RpcError::SessionExpired("sess-8".into()),
+            RpcError::CapacityExceeded("table full".into()),
         ] {
             let json = serde_json::to_string(&err).unwrap();
             let back: RpcError = serde_json::from_str(&json).unwrap();
             assert_eq!(format!("{err}"), format!("{back}"));
         }
+    }
+
+    #[test]
+    fn rpc_error_capacity_exceeded_roundtrip() {
+        let err = RpcError::CapacityExceeded("too many sessions".into());
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("capacity_exceeded") || json.contains("CapacityExceeded"));
+        let back: RpcError = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, RpcError::CapacityExceeded(_)));
+        assert_eq!(format!("{err}"), format!("{back}"));
     }
 
     #[test]
@@ -317,6 +383,7 @@ mod tests {
     fn rpc_request_execute_roundtrip() {
         let req = RpcRequest::Execute(ExecuteRequest {
             environment_id: EnvironmentId::new("dev"),
+            session_id: crate::SessionId::new("sess-1"),
             program: "cargo".into(),
             args: vec!["test".into()],
             working_directory: ".".into(),
@@ -332,6 +399,7 @@ mod tests {
     fn rpc_request_process_status_roundtrip() {
         let req = RpcRequest::ProcessStatus(ProcessStatusRequest {
             environment_id: EnvironmentId::new("dev"),
+            session_id: crate::SessionId::new("sess-1"),
             process_id: crate::ProcessId::new("proc-1"),
         });
         let json = serde_json::to_string(&req).unwrap();
@@ -344,6 +412,7 @@ mod tests {
     fn rpc_request_terminate_process_roundtrip() {
         let req = RpcRequest::TerminateProcess(TerminateProcessRequest {
             environment_id: EnvironmentId::new("dev"),
+            session_id: crate::SessionId::new("sess-1"),
             process_id: crate::ProcessId::new("proc-1"),
             force: false,
         });
@@ -357,6 +426,7 @@ mod tests {
     fn rpc_request_wait_process_roundtrip() {
         let req = RpcRequest::WaitProcess(WaitProcessRequest {
             environment_id: EnvironmentId::new("dev"),
+            session_id: crate::SessionId::new("sess-1"),
             process_id: crate::ProcessId::new("proc-1"),
             timeout_secs: 30,
         });
@@ -445,5 +515,83 @@ mod tests {
         let back: RpcResponse = serde_json::from_str(&json).unwrap();
         let json2 = serde_json::to_string(&back).unwrap();
         assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn rpc_request_session_roundtrips() {
+        let cases = [
+            RpcRequest::CreateSession(CreateSessionRequest {
+                environment_id: EnvironmentId::new("dev"),
+                working_directory: Some("sub".into()),
+                env_vars: std::collections::HashMap::new(),
+            }),
+            RpcRequest::GetSession(GetSessionRequest {
+                environment_id: EnvironmentId::new("dev"),
+                session_id: crate::SessionId::new("sess-1"),
+            }),
+            RpcRequest::ListSessions(ListSessionsRequest {
+                environment_id: EnvironmentId::new("dev"),
+            }),
+            RpcRequest::TerminateSession(TerminateSessionRequest {
+                environment_id: EnvironmentId::new("dev"),
+                session_id: crate::SessionId::new("sess-1"),
+            }),
+        ];
+        for req in cases {
+            let json = serde_json::to_string(&req).unwrap();
+            let back: RpcRequest = serde_json::from_str(&json).unwrap();
+            let json2 = serde_json::to_string(&back).unwrap();
+            assert_eq!(json, json2);
+        }
+    }
+
+    #[test]
+    fn rpc_response_session_roundtrips() {
+        let info = crate::SessionInfo {
+            session_id: crate::SessionId::new("sess-1"),
+            environment_id: EnvironmentId::new("dev"),
+            working_directory: ".".into(),
+            env_vars: std::collections::HashMap::new(),
+            created_at: 1_000_000,
+            last_activity: 1_000_100,
+            owner: None,
+        };
+        let cases = [
+            RpcResponsePayload::CreateSession(CreateSessionResponse {
+                session: info.clone(),
+            }),
+            RpcResponsePayload::GetSession(GetSessionResponse {
+                session: info.clone(),
+            }),
+            RpcResponsePayload::ListSessions(ListSessionsResponse {
+                sessions: vec![info.clone()],
+            }),
+            RpcResponsePayload::TerminateSession(TerminateSessionResponse {
+                terminated_processes: 3,
+            }),
+        ];
+        for payload in cases {
+            let resp = RpcResponse {
+                result: Ok(payload),
+            };
+            let json = serde_json::to_string(&resp).unwrap();
+            let back: RpcResponse = serde_json::from_str(&json).unwrap();
+            let json2 = serde_json::to_string(&back).unwrap();
+            assert_eq!(json, json2);
+        }
+    }
+
+    #[test]
+    fn rpc_response_session_error_roundtrip() {
+        for err in [
+            RpcError::SessionNotFound("sess-9".into()),
+            RpcError::SessionExpired("sess-8".into()),
+        ] {
+            let resp = RpcResponse { result: Err(err) };
+            let json = serde_json::to_string(&resp).unwrap();
+            let back: RpcResponse = serde_json::from_str(&json).unwrap();
+            let json2 = serde_json::to_string(&back).unwrap();
+            assert_eq!(json, json2);
+        }
     }
 }

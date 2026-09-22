@@ -20,19 +20,32 @@ pub mod fs;
 pub mod handler;
 pub mod process;
 pub mod server;
+pub mod session;
 pub mod tls;
 
 use are_core::{CapabilitySet, EnvironmentId, Platform};
 
 /// Daemon configuration.
+///
+/// `max_processes_per_session` is the single source of truth for the
+/// per-session process cap: `build_daemon_state` copies it into BOTH
+/// `SessionConfig` and `ProcessConfig`.
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
     /// The environment this daemon serves.
     pub environment_id: EnvironmentId,
     /// The port to listen on.
     pub port: u16,
-    /// Maximum concurrent sessions.
+    /// Maximum live sessions (Gate 6 session table bound).
     pub max_sessions: usize,
+    /// Maximum processes per session (live + retained terminal), enforced
+    /// by the process manager at spawn. `None` selects the default
+    /// (`DEFAULT_MAX_PROCESSES_PER_SESSION`, currently 32).
+    pub max_processes_per_session: Option<usize>,
+    /// Session idle timeout in seconds (Gate 6 expiry).
+    pub session_idle_timeout_secs: u64,
+    /// Session maximum lifetime in seconds since creation (Gate 6 expiry).
+    pub session_max_lifetime_secs: u64,
     /// Path to server certificate PEM file.
     pub server_cert_path: Option<String>,
     /// Path to server private key PEM file.
@@ -60,6 +73,9 @@ impl Default for DaemonConfig {
             environment_id: EnvironmentId::new("default"),
             port: 9000,
             max_sessions: 64,
+            max_processes_per_session: None,
+            session_idle_timeout_secs: crate::session::DEFAULT_SESSION_IDLE_TIMEOUT_SECS,
+            session_max_lifetime_secs: crate::session::DEFAULT_SESSION_MAX_LIFETIME_SECS,
             server_cert_path: None,
             server_key_path: None,
             client_ca_path: None,
@@ -131,11 +147,15 @@ pub fn build_daemon_state(config: &DaemonConfig) -> crate::handler::DaemonState 
 
     // Build the process manager: same environment binding, same filesystem
     // resolver for working-directory confinement, allow list from config.
+    let per_session_cap = config
+        .max_processes_per_session
+        .unwrap_or(crate::session::DEFAULT_MAX_PROCESSES_PER_SESSION);
     let mut proc_config = crate::process::ProcessConfig::default();
     if let Some(allowed) = &config.allowed_executables {
         proc_config.allowed_executables = Some(allowed.iter().cloned().collect());
     }
     proc_config.permissive = config.permissive_exec;
+    proc_config.max_processes_per_session = per_session_cap;
     if config.permissive_exec {
         eprintln!(
             "WARNING: --permissive-exec is set: any non-denied program may run (development only)"
@@ -154,8 +174,23 @@ pub fn build_daemon_state(config: &DaemonConfig) -> crate::handler::DaemonState 
         advertised_capabilities,
         platform,
     );
-    state.fs = fs;
+    state.fs = fs.clone();
     state.proc = Some(proc_manager);
+    // Sessions share the environment binding and filesystem resolver
+    // (session working directories resolve against the same allowed roots).
+    // The per-session process cap comes from the same `DaemonConfig`
+    // source as the process manager's cap above (single source of truth).
+    let session_config = crate::session::SessionConfig {
+        idle_timeout_secs: config.session_idle_timeout_secs,
+        max_lifetime_secs: config.session_max_lifetime_secs,
+        max_sessions: config.max_sessions,
+        max_processes_per_session: per_session_cap,
+    };
+    state.sessions = Some(std::sync::Arc::new(crate::session::SessionManager::new(
+        config.environment_id.clone(),
+        session_config,
+        fs,
+    )));
     state
 }
 
@@ -179,34 +214,6 @@ fn detect_platform(os: &str) -> Platform {
     }
 }
 
-/// Session manager tracking active sessions.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct SessionManager {
-    config: DaemonConfig,
-    next_id: usize,
-}
-
-#[allow(dead_code)]
-impl SessionManager {
-    /// Create a new session manager with the given config.
-    pub fn new(config: DaemonConfig) -> Self {
-        Self { config, next_id: 1 }
-    }
-
-    /// Create a new session. Returns a SessionId.
-    pub fn create_session(&mut self) -> are_core::SessionId {
-        let id = are_core::SessionId::new(format!("sess-{}", self.next_id));
-        self.next_id += 1;
-        id
-    }
-
-    /// Check if we're at capacity.
-    pub fn is_at_capacity(&self) -> bool {
-        false // stub
-    }
-}
-
 /// Entry point for the daemon binary.
 pub fn run(_config: DaemonConfig) -> Result<(), DaemonError> {
     // Placeholder — actual implementation in later gates.
@@ -220,25 +227,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_manager_creates_sessions() {
-        let config = DaemonConfig {
-            environment_id: EnvironmentId::new("test"),
-            ..Default::default()
-        };
-        let mut mgr = SessionManager::new(config);
-        let sid = mgr.create_session();
-        assert!(!sid.as_str().is_empty());
+    fn session_defaults_match_session_config() {
+        let config = DaemonConfig::default();
+        assert_eq!(
+            config.session_idle_timeout_secs,
+            crate::session::DEFAULT_SESSION_IDLE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            config.session_max_lifetime_secs,
+            crate::session::DEFAULT_SESSION_MAX_LIFETIME_SECS
+        );
+        assert_eq!(config.max_sessions, crate::session::DEFAULT_MAX_SESSIONS);
     }
 
     #[test]
-    fn not_at_capacity_by_default() {
+    fn build_daemon_state_wires_session_manager() {
+        let tmp = tempfile::TempDir::new().unwrap();
         let config = DaemonConfig {
-            environment_id: EnvironmentId::new("test"),
-            max_sessions: 1,
+            allowed_root: Some(tmp.path().to_path_buf()),
             ..Default::default()
         };
-        let mgr = SessionManager::new(config);
-        assert!(!mgr.is_at_capacity());
+        let state = build_daemon_state(&config);
+        let sessions = state.sessions.expect("session manager must be wired");
+        assert_eq!(
+            sessions.config().idle_timeout_secs,
+            config.session_idle_timeout_secs
+        );
+        assert_eq!(
+            sessions.config().max_lifetime_secs,
+            config.session_max_lifetime_secs
+        );
+        assert_eq!(sessions.config().max_sessions, config.max_sessions);
+        assert_eq!(
+            sessions.config().max_processes_per_session,
+            crate::session::DEFAULT_MAX_PROCESSES_PER_SESSION
+        );
+        let proc = state.proc.expect("process manager must be wired");
+        assert_eq!(
+            proc.config().max_processes_per_session,
+            crate::session::DEFAULT_MAX_PROCESSES_PER_SESSION
+        );
+    }
+
+    #[test]
+    fn build_daemon_state_copies_per_session_cap_to_both_managers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = DaemonConfig {
+            allowed_root: Some(tmp.path().to_path_buf()),
+            max_processes_per_session: Some(7),
+            ..Default::default()
+        };
+        let state = build_daemon_state(&config);
+        let sessions = state.sessions.expect("session manager must be wired");
+        let proc = state.proc.expect("process manager must be wired");
+        assert_eq!(sessions.config().max_processes_per_session, 7);
+        assert_eq!(proc.config().max_processes_per_session, 7);
     }
 
     #[test]

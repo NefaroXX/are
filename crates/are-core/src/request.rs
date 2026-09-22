@@ -4,25 +4,43 @@
 //! knowledge of SSH, TCP, TLS, or HTTP. Implementations map these to
 //! whatever wire format the transport uses.
 //!
-//! # Public API surface (Gate 5)
+//! # Public API surface (Gate 6)
 //!
 //! `ReadFile`, `ListDirectory`, `GetFileMetadata`, `Execute`,
-//! `ProcessStatus`, `TerminateProcess`, and `WaitProcess` are part of the
+//! `ProcessStatus`, `TerminateProcess`, `WaitProcess`, `CreateSession`,
+//! `GetSession`, `ListSessions`, and `TerminateSession` are part of the
 //! stable public API. `WriteFile` remains gated behind
 //! `#[cfg(any(test, feature = "future"))]` and is not re-exported from the
 //! crate root. It belongs to Gate 7.
 //!
-//! Processes are keyed by `(environment_id, process_id)` in daemon memory.
-//! Sessions do not exist yet (Gate 6 will bind processes to sessions);
-//! no session types are introduced here.
+//! Processes are keyed by `(environment_id, session_id, process_id)` in
+//! daemon memory. Every process operation requires a live session: the
+//! session carries the working directory and environment variables the
+//! process inherits.
 
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::EnvironmentId;
 use crate::ProcessId;
+use crate::SessionId;
+
+/// Current Unix timestamp in whole seconds.
+///
+/// `SystemTime::now` performs no I/O (no filesystem, network, or process
+/// access), so this helper is legal in `are-core`. Timestamps are `u64`
+/// seconds — not `SystemTime` — because `SystemTime` serde is
+/// platform-fragile (Gate 1 lesson). Returns `0` if the clock is before
+/// the epoch (should never happen; fail-safe, not fail-silent — callers
+/// treat `0` as "unknown time").
+pub fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -208,9 +226,58 @@ pub struct ListDirectoryResponse {
     pub entries: Vec<DirectoryEntry>,
 }
 
-// ---------------------------------------------------------------------------
-// Execute (Gate 5 — stable API)
-// ---------------------------------------------------------------------------
+/// Validate environment variable keys and values shared by
+/// [`ExecuteRequest`] and [`CreateSessionRequest`].
+///
+/// Rejects empty keys, keys containing `=` or NUL, oversized keys/values,
+/// NUL values, and a client-supplied `PATH`. `PATH` is rejected because the
+/// daemon resolves bare program names against its own trusted `PATH`;
+/// accepting a client `PATH` would let callers redirect bare names at
+/// attacker-controlled directories. Trusted `PATH` customization comes from
+/// daemon configuration only. Dynamic-loader keys (`LD_*`/`DYLD_*`) are NOT
+/// rejected here — they are stripped at spawn time (defense in depth: strip
+/// at session creation AND at spawn merge).
+fn validate_env_vars(env_vars: &HashMap<String, String>) -> Result<(), crate::CoreError> {
+    if env_vars.len() > MAX_EXEC_ENV_VARS {
+        return Err(crate::CoreError::InvalidRequest(format!(
+            "too many env vars: {} exceeds maximum {MAX_EXEC_ENV_VARS}",
+            env_vars.len()
+        )));
+    }
+    for (key, value) in env_vars {
+        if key.is_empty() {
+            return Err(crate::CoreError::InvalidRequest(
+                "env var key must not be empty".into(),
+            ));
+        }
+        if key.contains('=') || key.contains('\0') {
+            return Err(crate::CoreError::InvalidRequest(format!(
+                "invalid env var key: {key:?}"
+            )));
+        }
+        if key.len() > MAX_EXEC_ENV_KEY_LEN {
+            return Err(crate::CoreError::InvalidRequest(format!(
+                "env var key {key:?} exceeds maximum length {MAX_EXEC_ENV_KEY_LEN}"
+            )));
+        }
+        if value.len() > MAX_EXEC_ENV_VALUE_LEN {
+            return Err(crate::CoreError::InvalidRequest(format!(
+                "env var value for {key:?} exceeds maximum length {MAX_EXEC_ENV_VALUE_LEN}"
+            )));
+        }
+        if value.contains('\0') {
+            return Err(crate::CoreError::InvalidRequest(format!(
+                "env var value for {key:?} must not contain NUL"
+            )));
+        }
+        if key == "PATH" {
+            return Err(crate::CoreError::InvalidRequest(
+                "env var PATH must not be supplied: programs resolve against the daemon's trusted PATH".into(),
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Maximum number of arguments accepted in an [`ExecuteRequest`].
 pub const MAX_EXEC_ARGS: usize = 256;
@@ -231,6 +298,22 @@ pub const MAX_EXEC_ENV_VALUE_LEN: usize = 1024 * 1024;
 /// `execute_shell("arbitrary string")`: `program` is spawned directly
 /// without shell metacharacter interpretation.
 ///
+/// # Gate 6 session binding
+///
+/// Every execution requires a live [`SessionId`]: creation fails with
+/// `SessionNotFound`/`SessionExpired` when the session is unknown or aged
+/// out. The session supplies:
+///
+/// - **Working directory.** An empty `working_directory` (`""`) means
+///   "inherit the session's working directory". A non-empty value is
+///   resolved env-relative per ADR-002 (same boundary rules as sessions).
+/// - **Environment.** Merge order is daemon environment < session env <
+///   request env (request wins on key conflicts). The request and session
+///   layers are sanitized (`PATH` rejected at validation, `LD_*`/`DYLD_*`
+///   stripped at spawn); the daemon's own inherited base environment is NOT
+///   sanitized (documented Gate 5 decision: the base is trusted config, and
+///   `PATH` lookup for bare program names requires it).
+///
 /// Request-size bounds (enforced by [`ExecuteRequest::validate`]) keep a
 /// single request from forcing unbounded daemon allocations:
 /// at most [`MAX_EXEC_ARGS`] args of [`MAX_EXEC_ARG_LEN`] bytes each, and
@@ -239,14 +322,18 @@ pub const MAX_EXEC_ENV_VALUE_LEN: usize = 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecuteRequest {
     pub environment_id: EnvironmentId,
+    /// Session the process belongs to. Must be live at creation.
+    pub session_id: SessionId,
     /// Program to execute (e.g. `"cargo"`, `"git"`).
     pub program: String,
     /// Arguments to pass to the program.
     pub args: Vec<String>,
     /// Environment-relative working directory, resolved against allowed
-    /// roots. Must not escape the environment boundary.
+    /// roots. Empty (`""`) inherits the session's working directory.
+    /// Must not escape the environment boundary.
     pub working_directory: String,
-    /// Environment variables to set.
+    /// Environment variables to set (one-shot overrides on top of the
+    /// session env; same key rules, including `PATH` rejection).
     pub env_vars: HashMap<String, String>,
 }
 
@@ -258,6 +345,9 @@ impl ExecuteRequest {
     /// resolves programs against its own trusted `PATH`; accepting a
     /// client `PATH` would let callers redirect bare program names at
     /// attacker-controlled directories).
+    ///
+    /// An empty `working_directory` is VALID (means "inherit the session's
+    /// directory"); NUL bytes in it are still rejected.
     pub fn validate(&self) -> Result<(), crate::CoreError> {
         if self.program.is_empty() {
             return Err(crate::CoreError::InvalidRequest(
@@ -269,9 +359,9 @@ impl ExecuteRequest {
                 "program must not contain NUL".into(),
             ));
         }
-        if self.working_directory.is_empty() {
+        if self.working_directory.contains('\0') {
             return Err(crate::CoreError::InvalidRequest(
-                "working_directory must not be empty".into(),
+                "working_directory must not contain NUL".into(),
             ));
         }
         if self.args.len() > MAX_EXEC_ARGS {
@@ -292,45 +382,7 @@ impl ExecuteRequest {
                 )));
             }
         }
-        if self.env_vars.len() > MAX_EXEC_ENV_VARS {
-            return Err(crate::CoreError::InvalidRequest(format!(
-                "too many env vars: {} exceeds maximum {MAX_EXEC_ENV_VARS}",
-                self.env_vars.len()
-            )));
-        }
-        for (key, value) in &self.env_vars {
-            if key.is_empty() {
-                return Err(crate::CoreError::InvalidRequest(
-                    "env var key must not be empty".into(),
-                ));
-            }
-            if key.contains('=') || key.contains('\0') {
-                return Err(crate::CoreError::InvalidRequest(format!(
-                    "invalid env var key: {key:?}"
-                )));
-            }
-            if key.len() > MAX_EXEC_ENV_KEY_LEN {
-                return Err(crate::CoreError::InvalidRequest(format!(
-                    "env var key {key:?} exceeds maximum length {MAX_EXEC_ENV_KEY_LEN}"
-                )));
-            }
-            if value.len() > MAX_EXEC_ENV_VALUE_LEN {
-                return Err(crate::CoreError::InvalidRequest(format!(
-                    "env var value for {key:?} exceeds maximum length {MAX_EXEC_ENV_VALUE_LEN}"
-                )));
-            }
-            if value.contains('\0') {
-                return Err(crate::CoreError::InvalidRequest(format!(
-                    "env var value for {key:?} must not contain NUL"
-                )));
-            }
-            if key == "PATH" {
-                return Err(crate::CoreError::InvalidRequest(
-                    "env var PATH must not be supplied: programs resolve against the daemon's trusted PATH".into(),
-                ));
-            }
-        }
-        Ok(())
+        validate_env_vars(&self.env_vars)
     }
 }
 
@@ -342,13 +394,18 @@ pub struct ExecuteResponse {
 }
 
 // ---------------------------------------------------------------------------
-// ProcessStatus (Gate 5 — stable API)
+// ProcessStatus (Gate 5 — stable API, Gate 6 session binding)
 // ---------------------------------------------------------------------------
 
 /// Request to query process status.
+///
+/// Lookup key is `(environment_id, session_id, process_id)`; a session
+/// mismatch yields `NotFound` (indistinguishable from an unknown process
+/// id — no oracle into other sessions' processes).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessStatusRequest {
     pub environment_id: EnvironmentId,
+    pub session_id: SessionId,
     pub process_id: ProcessId,
 }
 
@@ -359,10 +416,13 @@ pub struct ProcessStatusResponse {
 }
 
 // ---------------------------------------------------------------------------
-// TerminateProcess (Gate 5 — stable API)
+// TerminateProcess (Gate 5 — stable API, Gate 6 session binding)
 // ---------------------------------------------------------------------------
 
 /// Request to terminate a process.
+///
+/// Lookup key is `(environment_id, session_id, process_id)`; a session
+/// mismatch yields `NotFound` (no oracle).
 ///
 /// Gate 5 has no SIGTERM/SIGKILL distinction yet (both terminate
 /// forcefully; see the daemon's process manager). The `force` flag is
@@ -370,6 +430,7 @@ pub struct ProcessStatusResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminateProcessRequest {
     pub environment_id: EnvironmentId,
+    pub session_id: SessionId,
     pub process_id: ProcessId,
     /// If `true`, force-kill; otherwise terminate gracefully.
     /// Currently both paths are forceful — documented, not silent.
@@ -385,7 +446,149 @@ pub struct TerminateProcessResponse {
 }
 
 // ---------------------------------------------------------------------------
-// WaitProcess (Gate 5 — stable API)
+// Sessions (Gate 6 — stable API)
+// ---------------------------------------------------------------------------
+
+/// Request to create a persistent session in the environment.
+///
+/// The session becomes the carrier of working directory and environment
+/// state: processes spawned into it inherit both (see [`ExecuteRequest`]).
+/// Sessions live in daemon memory and survive client disconnects (every RPC
+/// is already a fresh TLS connection); they do NOT survive daemon restarts
+/// (memory-only, like processes — documented, not promised).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateSessionRequest {
+    pub environment_id: EnvironmentId,
+    /// Environment-relative working directory, resolved against allowed
+    /// roots at creation (must exist and be a directory). `None` means the
+    /// environment default (`"."`).
+    pub working_directory: Option<String>,
+    /// Environment variables for the session. Same key rules as
+    /// [`ExecuteRequest`] (including `PATH` rejection — trusted `PATH`
+    /// comes from daemon config only).
+    pub env_vars: HashMap<String, String>,
+}
+
+impl CreateSessionRequest {
+    /// Validate env keys/values plus the optional working directory shape.
+    ///
+    /// `Some("")` is rejected (empty means "inherit", which is meaningless
+    /// at creation — pass `None` for the default). Existence, directoryness,
+    /// and boundary checks happen daemon-side against the filesystem.
+    pub fn validate(&self) -> Result<(), crate::CoreError> {
+        if let Some(workdir) = &self.working_directory {
+            if workdir.is_empty() {
+                return Err(crate::CoreError::InvalidRequest(
+                    "working_directory must not be empty: pass None for the default".into(),
+                ));
+            }
+            if workdir.contains('\0') {
+                return Err(crate::CoreError::InvalidRequest(
+                    "working_directory must not contain NUL".into(),
+                ));
+            }
+        }
+        validate_env_vars(&self.env_vars)
+    }
+}
+
+/// A persistent session: working directory + environment + processes.
+///
+/// Returned by creation and by `GetSession` (the resume operation).
+/// Timestamps are Unix seconds (see [`now_secs`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    /// Session identity (CSPRNG `sess-<32hex>`, unguessable like proc ids).
+    pub session_id: SessionId,
+    /// Environment this session belongs to.
+    pub environment_id: EnvironmentId,
+    /// Environment-relative working directory (as supplied at creation).
+    /// Processes with an empty request workdir inherit this.
+    pub working_directory: String,
+    /// Session environment variables (sanitized copy).
+    pub env_vars: HashMap<String, String>,
+    /// Creation time, Unix seconds.
+    pub created_at: u64,
+    /// Last activity time, Unix seconds. Bumped on every session-scoped
+    /// operation (create/get/execute/status/wait/terminate); drives idle
+    /// expiry. Listing sessions does NOT bump activity.
+    pub last_activity: u64,
+    /// Owning principal, if bound. `None` means a legacy single-principal
+    /// session with no owner check (current behavior: every client may
+    /// address every session by unguessable id). Gate 8 binds this to the
+    /// client-certificate identity and enforces ownership.
+    #[serde(default)]
+    pub owner: Option<String>,
+}
+
+/// Response containing the created session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateSessionResponse {
+    pub session: SessionInfo,
+}
+
+/// Request to fetch a session by id — this IS the resume operation.
+///
+/// `create → disconnect → reconnect → get` recovers working directory and
+/// env state. Returns `SessionExpired` when the session aged out (the entry
+/// is removed), `SessionNotFound` when the id is unknown.
+///
+/// `environment_id` scopes the lookup: a session that belongs to a
+/// different environment misses with `NotFound` (same rule as process
+/// ops — no cross-environment oracle).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetSessionRequest {
+    pub environment_id: EnvironmentId,
+    pub session_id: SessionId,
+}
+
+/// Response containing the resumed session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetSessionResponse {
+    pub session: SessionInfo,
+}
+
+/// Request to list live sessions in an environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListSessionsRequest {
+    pub environment_id: EnvironmentId,
+}
+
+/// Response with the live sessions for the environment.
+///
+/// Expired sessions are purged opportunistically before listing and never
+/// appear here. Listing bumps no activity timestamps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListSessionsResponse {
+    pub sessions: Vec<SessionInfo>,
+}
+
+/// Request to terminate a session.
+///
+/// Cascades: all session processes are killed best-effort (direct children
+/// only — inherited from the Gate 5 terminate limitation), then the session
+/// is removed. Kill-then-remove ordering means a crash between the two
+/// leaves either a dead session entry or orphaned processes, both of which
+/// fail closed on next access.
+///
+/// `environment_id` scopes the operation like [`GetSessionRequest`]: a
+/// session in another environment misses with `NotFound`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminateSessionRequest {
+    pub environment_id: EnvironmentId,
+    pub session_id: SessionId,
+}
+
+/// Response from terminating a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminateSessionResponse {
+    /// Number of session processes the cascade killed. Counts live kills
+    /// only: already-terminal entries are not signaled and not counted.
+    pub terminated_processes: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Execute (Gate 5 — stable API, Gate 6 session binding)
 // ---------------------------------------------------------------------------
 
 /// Minimum `timeout_secs` accepted by [`WaitProcessRequest`].
@@ -399,12 +602,16 @@ pub const MAX_WAIT_TIMEOUT_SECS: u64 = 3600;
 /// Blocks until the process exits or the timeout elapses, then returns a
 /// snapshot of the capped captured output.
 ///
+/// Lookup key is `(environment_id, session_id, process_id)`; a session
+/// mismatch yields `NotFound` (no oracle).
+///
 /// The timeout is **required** (`1..=3600` seconds): indefinite waits are
 /// rejected because a single-request transport must always make progress.
 /// There is no `None`/infinite variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitProcessRequest {
     pub environment_id: EnvironmentId,
+    pub session_id: SessionId,
     pub process_id: ProcessId,
     /// Maximum seconds to wait, `1..=3600`.
     pub timeout_secs: u64,
@@ -453,6 +660,10 @@ mod tests {
 
     fn eid() -> EnvironmentId {
         EnvironmentId::new("test-env")
+    }
+
+    fn sid() -> SessionId {
+        SessionId::new("sess-1")
     }
 
     fn pid() -> ProcessId {
@@ -550,6 +761,7 @@ mod tests {
     fn execute_validate_valid() {
         let req = ExecuteRequest {
             environment_id: eid(),
+            session_id: sid(),
             program: "cargo".into(),
             args: vec!["test".into()],
             working_directory: "/workspace".into(),
@@ -562,6 +774,7 @@ mod tests {
     fn execute_validate_empty_program() {
         let req = ExecuteRequest {
             environment_id: eid(),
+            session_id: sid(),
             program: String::new(),
             args: vec![],
             working_directory: "/workspace".into(),
@@ -571,12 +784,28 @@ mod tests {
     }
 
     #[test]
-    fn execute_validate_empty_working_dir() {
+    fn execute_validate_empty_working_dir_inherits_session() {
+        // Gate 6: empty working_directory means "inherit the session's
+        // directory", so it validates � the daemon resolves it.
         let req = ExecuteRequest {
             environment_id: eid(),
+            session_id: sid(),
             program: "ls".into(),
             args: vec![],
             working_directory: String::new(),
+            env_vars: HashMap::new(),
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn execute_validate_rejects_nul_working_dir() {
+        let req = ExecuteRequest {
+            environment_id: eid(),
+            session_id: sid(),
+            program: "ls".into(),
+            args: vec![],
+            working_directory: "a b".into(),
             env_vars: HashMap::new(),
         };
         assert!(req.validate().is_err());
@@ -586,6 +815,7 @@ mod tests {
     fn execute_validate_rejects_bad_env_keys() {
         let base = || ExecuteRequest {
             environment_id: eid(),
+            session_id: sid(),
             program: "cargo".into(),
             args: vec![],
             working_directory: "/workspace".into(),
@@ -618,6 +848,7 @@ mod tests {
     fn execute_validate_rejects_oversized_payloads() {
         let base = || ExecuteRequest {
             environment_id: eid(),
+            session_id: sid(),
             program: "cargo".into(),
             args: vec![],
             working_directory: "/workspace".into(),
@@ -662,6 +893,7 @@ mod tests {
     fn execute_validate_rejects_client_supplied_path() {
         let mut req = ExecuteRequest {
             environment_id: eid(),
+            session_id: sid(),
             program: "cargo".into(),
             args: vec![],
             working_directory: "/workspace".into(),
@@ -676,6 +908,7 @@ mod tests {
     fn wait_validate_timeout_bounds() {
         let base = |timeout: u64| WaitProcessRequest {
             environment_id: eid(),
+            session_id: sid(),
             process_id: pid(),
             timeout_secs: timeout,
         };
@@ -775,6 +1008,7 @@ mod tests {
     fn execute_roundtrip() {
         let req = ExecuteRequest {
             environment_id: eid(),
+            session_id: sid(),
             program: "cargo".into(),
             args: vec!["build".into()],
             working_directory: "/workspace".into(),
@@ -794,6 +1028,7 @@ mod tests {
     fn process_status_roundtrip() {
         let req = ProcessStatusRequest {
             environment_id: eid(),
+            session_id: sid(),
             process_id: pid(),
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -821,6 +1056,7 @@ mod tests {
     fn terminate_roundtrip() {
         let req = TerminateProcessRequest {
             environment_id: eid(),
+            session_id: sid(),
             process_id: pid(),
             force: true,
         };
@@ -838,6 +1074,7 @@ mod tests {
     fn wait_roundtrip() {
         let req = WaitProcessRequest {
             environment_id: eid(),
+            session_id: sid(),
             process_id: pid(),
             timeout_secs: 30,
         };
@@ -855,5 +1092,173 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let back: WaitProcessResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(resp, back);
+    }
+
+    // ---- Sessions (Gate 6) ----
+
+    fn session_info() -> SessionInfo {
+        SessionInfo {
+            session_id: sid(),
+            environment_id: eid(),
+            working_directory: ".".into(),
+            env_vars: HashMap::from([("FOO".into(), "bar".into())]),
+            created_at: 1_000_000,
+            last_activity: 1_000_100,
+            owner: None,
+        }
+    }
+
+    #[test]
+    fn create_session_validate_valid() {
+        let req = CreateSessionRequest {
+            environment_id: eid(),
+            working_directory: Some(".".into()),
+            env_vars: HashMap::new(),
+        };
+        assert!(req.validate().is_ok());
+        let req = CreateSessionRequest {
+            environment_id: eid(),
+            working_directory: None,
+            env_vars: HashMap::from([("FOO".into(), "bar".into())]),
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn create_session_validate_rejects_empty_some_workdir() {
+        let req = CreateSessionRequest {
+            environment_id: eid(),
+            working_directory: Some(String::new()),
+            env_vars: HashMap::new(),
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn create_session_validate_rejects_path_env() {
+        let req = CreateSessionRequest {
+            environment_id: eid(),
+            working_directory: None,
+            env_vars: HashMap::from([("PATH".into(), "/tmp/evil".into())]),
+        };
+        let err = req.validate().unwrap_err();
+        assert!(format!("{err}").contains("PATH"));
+    }
+
+    #[test]
+    fn create_session_validate_rejects_bad_env_keys() {
+        for (k, v) in [
+            (String::new(), "v".to_string()),
+            ("A=B".to_string(), "v".to_string()),
+            ("A ".to_string(), "v".to_string()),
+            ("A".to_string(), "v ".to_string()),
+        ] {
+            let req = CreateSessionRequest {
+                environment_id: eid(),
+                working_directory: None,
+                env_vars: HashMap::from([(k, v)]),
+            };
+            assert!(req.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn session_info_roundtrip() {
+        let info = session_info();
+        let json = serde_json::to_string(&info).unwrap();
+        let back: SessionInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(info, back);
+    }
+
+    #[test]
+    fn session_info_owner_defaults_to_none_for_legacy_json() {
+        // Back-compat: pre-owner JSON (no `owner` key) must parse with
+        // `owner == None` via `#[serde(default)]`.
+        let legacy = serde_json::json!({
+            "session_id": "sess-1",
+            "environment_id": "test-env",
+            "working_directory": ".",
+            "env_vars": {},
+            "created_at": 1_000_000,
+            "last_activity": 1_000_100,
+        });
+        let back: SessionInfo = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.owner, None);
+        let owned = session_info_with_owner();
+        let json = serde_json::to_string(&owned).unwrap();
+        let back: SessionInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.owner.as_deref(), Some("client-a"));
+    }
+
+    fn session_info_with_owner() -> SessionInfo {
+        SessionInfo {
+            owner: Some("client-a".into()),
+            ..session_info()
+        }
+    }
+
+    #[test]
+    fn session_requests_roundtrip() {
+        let cases = [
+            serde_json::to_string(&CreateSessionRequest {
+                environment_id: eid(),
+                working_directory: Some("sub".into()),
+                env_vars: HashMap::new(),
+            })
+            .unwrap(),
+            serde_json::to_string(&GetSessionRequest {
+                environment_id: eid(),
+                session_id: sid(),
+            })
+            .unwrap(),
+            serde_json::to_string(&GetSessionResponse {
+                session: session_info(),
+            })
+            .unwrap(),
+            serde_json::to_string(&ListSessionsRequest {
+                environment_id: eid(),
+            })
+            .unwrap(),
+            serde_json::to_string(&ListSessionsResponse {
+                sessions: vec![session_info()],
+            })
+            .unwrap(),
+            serde_json::to_string(&TerminateSessionRequest {
+                environment_id: eid(),
+                session_id: sid(),
+            })
+            .unwrap(),
+            serde_json::to_string(&TerminateSessionResponse {
+                terminated_processes: 2,
+            })
+            .unwrap(),
+        ];
+        // Each serializes; spot-check deserialization of each type.
+        let back: CreateSessionRequest = serde_json::from_str(&cases[0]).unwrap();
+        assert_eq!(back.working_directory.as_deref(), Some("sub"));
+        let back: GetSessionRequest = serde_json::from_str(&cases[1]).unwrap();
+        assert_eq!(back.session_id, sid());
+        let back: GetSessionResponse = serde_json::from_str(&cases[2]).unwrap();
+        assert_eq!(back.session, session_info());
+        let back: ListSessionsRequest = serde_json::from_str(&cases[3]).unwrap();
+        assert_eq!(back.environment_id, eid());
+        let back: ListSessionsResponse = serde_json::from_str(&cases[4]).unwrap();
+        assert_eq!(back.sessions, vec![session_info()]);
+        let back: TerminateSessionRequest = serde_json::from_str(&cases[5]).unwrap();
+        assert_eq!(back.session_id, sid());
+        let back: TerminateSessionResponse = serde_json::from_str(&cases[6]).unwrap();
+        assert_eq!(back.terminated_processes, 2);
+    }
+
+    #[test]
+    fn now_secs_is_sane() {
+        // Sanity only: nonzero and nondecreasing across calls.
+        let a = now_secs();
+        assert!(
+            a > 1_700_000_000,
+            "now_secs should be a real Unix time, got {a}"
+        );
+        let b = now_secs();
+        assert!(b >= a);
     }
 }
