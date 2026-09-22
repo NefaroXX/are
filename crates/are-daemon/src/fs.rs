@@ -517,12 +517,27 @@ mod tests {
         // On Unix, create a file with no read permissions.
         #[cfg(unix)]
         {
+            use std::os::unix::fs::PermissionsExt;
             let backend = &_backend;
             let path = backend.config().allowed_roots[0].join("noperm.txt");
             std::fs::write(&path, b"secret").unwrap();
             let mut perms = std::fs::metadata(&path).unwrap().permissions();
             perms.set_mode(0o000);
             std::fs::set_permissions(&path, perms).unwrap();
+
+            // Running as root (or another privileged user) bypasses file
+            // mode bits, so the denial cannot trigger. Detect that and
+            // skip rather than fail: the mapping itself is covered by the
+            // non-privileged case and by handler-level tests.
+            if std::fs::File::open(&path).is_ok() {
+                eprintln!(
+                    "SKIP read_file_permission_denied: process can still open mode-000 files (running as root?)"
+                );
+                let mut restore = std::fs::metadata(&path).unwrap().permissions();
+                restore.set_mode(0o644);
+                std::fs::set_permissions(&path, restore).unwrap();
+                return;
+            }
 
             let result = backend.read_file("noperm.txt").await;
             assert!(
