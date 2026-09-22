@@ -651,7 +651,6 @@ async fn process_table_bounded_evicts_oldest_terminal_first() {
     // Tiny table: 1 live slot + 2 terminal slots.
     let (_tmp, mgr) = test_manager_full(4096, None, Some(3), Some(3600));
     let sess = make_session(_tmp.path());
-    let sess = make_session(_tmp.path());
 
     // One live process that must never be evicted.
     let live = mgr
@@ -713,7 +712,6 @@ async fn process_table_full_of_live_processes_rejects_spawn() {
     };
     let (_tmp, mgr) = test_manager_full(4096, None, Some(2), Some(3600));
     let sess = make_session(_tmp.path());
-    let sess = make_session(_tmp.path());
 
     let first = mgr
         .start(exec_req(&sess, sleep, &["30"], "."), &sess)
@@ -753,7 +751,6 @@ async fn expired_terminal_entries_evictable_by_retention() {
     // test only asserts the bound + queryability, not eviction itself —
     // deterministic expiry is covered by unit tests with fabricated ages.)
     let (_tmp, mgr) = test_manager_full(4096, None, Some(4), Some(0));
-    let sess = make_session(_tmp.path());
     let sess = make_session(_tmp.path());
 
     let mut ids = Vec::new();
