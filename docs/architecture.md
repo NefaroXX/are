@@ -271,7 +271,7 @@ This architecture is the foundation (Gate 0). Future gates add capability increm
 | 3 | Minimal secure connection (TLS 1.3 mTLS + GetEnvironmentInfo) | ✓ Complete (scoped: TLS 1.3 mTLS + GetEnvironmentInfo only; revocation/rotation/capability enforcement = designed) |
 | 3.5 | Boundary cleanup (implemented vs designed, ADRs, advertised_capabilities, path semantics) | ✓ Complete |
 | 4 | Read-only filesystem access | ✓ Complete (env-relative, allowed roots, traversal/symlink/escape/TOCTOU, file_metadata, 16 MiB cap, advertised read+list) |
-| 5 | Process execution (structured, no shell) | Pending |
+| 5 | Process execution (structured, no shell) | ✓ Complete (deny-wins + fail-closed allowlist, env sanitization, CSPRNG ids, bounded table/retention, 8 MiB output caps, wait/terminate, advertised process caps) |
 | 6 | Persistent agent sessions | Pending |
 | 7 | Filesystem write operations | Pending |
 | 8 | Capability-based authorization | Pending |

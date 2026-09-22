@@ -358,7 +358,7 @@ mod tests {
         let req = RpcRequest::WaitProcess(WaitProcessRequest {
             environment_id: EnvironmentId::new("dev"),
             process_id: crate::ProcessId::new("proc-1"),
-            timeout_secs: Some(30),
+            timeout_secs: 30,
         });
         let json = serde_json::to_string(&req).unwrap();
         let back: RpcRequest = serde_json::from_str(&json).unwrap();

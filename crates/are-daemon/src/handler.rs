@@ -310,12 +310,17 @@ impl DaemonState {
 /// Map a process error to an RPC error, preserving the error category so
 /// clients can distinguish policy rejection (`DeniedExecutable`), unknown
 /// ids (`NotFound`), malformed requests (`InvalidRequest`), and daemon
-/// failures (`InternalError`).
+/// failures (`InternalError`). Fail-closed refusals (`PolicyDenied`) and
+/// capacity refusals (`TooManyProcesses`) map onto the closest existing
+/// categories — policy and internal failure respectively — since the wire
+/// protocol has no dedicated codes for them yet.
 fn process_error_to_rpc(err: ProcessError) -> RpcError {
     match err {
         ProcessError::InvalidRequest(msg) => RpcError::InvalidRequest(msg),
         ProcessError::EnvironmentMismatch(msg) => RpcError::InvalidRequest(msg),
         ProcessError::DeniedExecutable(msg) => RpcError::DeniedExecutable(msg),
+        ProcessError::PolicyDenied(msg) => RpcError::DeniedExecutable(msg),
+        ProcessError::TooManyProcesses(msg) => RpcError::InternalError(msg),
         ProcessError::NotFound(msg) => RpcError::NotFound(msg),
         ProcessError::Io(msg) => RpcError::InternalError(msg),
         ProcessError::Internal(msg) => RpcError::InternalError(msg),
@@ -523,14 +528,18 @@ mod tests {
     // ---- Gate 5: process dispatch ----
 
     /// Build a `DaemonState` wired with a filesystem backend rooted at a
-    /// temp dir and a permissive process manager.
+    /// temp dir and an explicitly permissive process manager (tests opt in;
+    /// the production default is fail-closed).
     fn proc_state() -> (tempfile::TempDir, DaemonState) {
         let tmp = tempfile::TempDir::new().unwrap();
         let fs =
             FilesystemBackend::new(FilesystemConfig::new(&[tmp.path().to_path_buf()]).unwrap());
         let proc = Arc::new(ProcessManager::new(
             EnvironmentId::new("test-env"),
-            ProcessConfig::default(),
+            ProcessConfig {
+                permissive: true,
+                ..ProcessConfig::default()
+            },
             Some(fs.clone()),
         ));
         let mut caps = CapabilitySet::default();
@@ -634,8 +643,21 @@ mod tests {
         let (_tmp, state) = proc_state();
         let req = RpcRequest::WaitProcess(are_core::WaitProcessRequest {
             environment_id: EnvironmentId::new("test-env"),
-            process_id: are_core::ProcessId::new("proc-000001"),
-            timeout_secs: Some(are_core::MAX_WAIT_TIMEOUT_SECS + 1),
+            process_id: are_core::ProcessId::new("proc-999999"),
+            timeout_secs: are_core::MAX_WAIT_TIMEOUT_SECS + 1,
+        });
+
+        let resp = state.handle(req);
+        assert!(matches!(resp.result, Err(RpcError::InvalidRequest(_))));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_wait_rejects_zero_timeout() {
+        let (_tmp, state) = proc_state();
+        let req = RpcRequest::WaitProcess(are_core::WaitProcessRequest {
+            environment_id: EnvironmentId::new("test-env"),
+            process_id: are_core::ProcessId::new("proc-999999"),
+            timeout_secs: 0,
         });
 
         let resp = state.handle(req);
@@ -668,7 +690,7 @@ mod tests {
         let req = RpcRequest::WaitProcess(are_core::WaitProcessRequest {
             environment_id: EnvironmentId::new("test-env"),
             process_id: process_id.clone(),
-            timeout_secs: Some(10),
+            timeout_secs: 10,
         });
         let resp = state.handle(req);
         match resp.result {

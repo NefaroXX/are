@@ -201,16 +201,17 @@ impl FilesystemBackend {
                     if canonical.starts_with(root) {
                         return Ok(canonical);
                     }
-                    // Symlink or traversal escaped the root.
+                    // Symlink or traversal escaped the root. The remote-facing
+                    // error is generic: canonical paths must not reach
+                    // clients. Full paths go only to server-side logs here.
                     tracing::debug!(
                         canonical = %canonical.display(),
                         root = %root.display(),
                         "path escapes root"
                     );
-                    return Err(FsError::FilesystemEscape(format!(
-                        "resolved path '{}' escapes allowed root",
-                        canonical.display(),
-                    )));
+                    return Err(FsError::FilesystemEscape(
+                        "path escapes allowed boundary".into(),
+                    ));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     // Target doesn't exist — validate the parent directory instead.
@@ -230,16 +231,16 @@ impl FilesystemBackend {
                                     ));
                                 }
                                 // Parent escaped — this shouldn't happen if the root is valid,
-                                // but be defensive.
+                                // but be defensive. Remote-facing error stays
+                                // generic; paths go only to the log above.
                                 tracing::debug!(
                                     canonical_parent = %canonical_parent.display(),
                                     root = %root.display(),
                                     "parent escapes root"
                                 );
-                                return Err(FsError::FilesystemEscape(format!(
-                                    "parent '{}' escapes allowed root",
-                                    canonical_parent.display(),
-                                )));
+                                return Err(FsError::FilesystemEscape(
+                                    "path escapes allowed boundary".into(),
+                                ));
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                                 // Parent doesn't exist either — try next root or fail.
@@ -264,9 +265,12 @@ impl FilesystemBackend {
             }
         }
 
-        Err(FsError::FilesystemEscape(format!(
-            "path '{path}' does not resolve under any allowed root"
-        )))
+        // Generic remote-facing message (no client path echo, no canonical
+        // paths); the failing path is server-side log detail only.
+        tracing::debug!(path = %path, "path does not resolve under any allowed root");
+        Err(FsError::FilesystemEscape(
+            "path escapes allowed boundary".into(),
+        ))
     }
 
     /// Read a file from the environment.

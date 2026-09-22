@@ -43,6 +43,7 @@ pub use request::{
     GetFileMetadataResponse, ListDirectoryRequest, ListDirectoryResponse, ProcessState,
     ProcessStatusRequest, ProcessStatusResponse, ReadFileRequest, ReadFileResponse,
     TerminateProcessRequest, TerminateProcessResponse, WaitProcessRequest, WaitProcessResponse,
-    MAX_WAIT_TIMEOUT_SECS,
+    MAX_EXEC_ARGS, MAX_EXEC_ARG_LEN, MAX_EXEC_ENV_KEY_LEN, MAX_EXEC_ENV_VALUE_LEN,
+    MAX_EXEC_ENV_VARS, MAX_WAIT_TIMEOUT_SECS, MIN_WAIT_TIMEOUT_SECS,
 };
 pub use traits::Environment as EnvironmentOps;

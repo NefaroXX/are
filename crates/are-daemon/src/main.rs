@@ -66,11 +66,20 @@ enum Commands {
 
         /// Comma-separated allow list of program basenames for process
         /// execution (e.g. `--allow-exec cargo,git,npm,node,python`).
-        /// If omitted, any non-denied program may run (development mode,
-        /// with a warning logged per spawn). The deny list
-        /// (shutdown/reboot/poweroff/halt/init) is always enforced.
+        /// If omitted, the daemon is fail-closed and refuses every spawn;
+        /// use `--permissive-exec` (development only) to allow any
+        /// non-denied program. The deny list
+        /// (shutdown/reboot/poweroff/halt/init, plus `.exe`/case variants)
+        /// is always enforced.
         #[arg(long)]
         allow_exec: Option<String>,
+
+        /// Development only: permit any non-denied program when no
+        /// `--allow-exec` list is configured. The deny list still applies.
+        /// NEVER use in production — any client could run arbitrary
+        /// binaries. Logs a loud warning at startup and per spawn.
+        #[arg(long)]
+        permissive_exec: bool,
     },
 }
 
@@ -96,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ca,
             allowed_root,
             allow_exec,
+            permissive_exec,
         } => {
             let env_id = EnvironmentId::try_new(&environment_id)
                 .map_err(|e| format!("invalid environment_id: {e}"))?;
@@ -138,7 +148,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map(str::to_string)
                         .collect()
                 }),
+                permissive_exec,
             };
+
+            if permissive_exec {
+                tracing::warn!(
+                    "--permissive-exec: DEVELOPMENT ONLY — any non-denied program may run"
+                );
+            }
 
             let state = are_daemon::build_daemon_state(&config);
             let tls_config = build_tls_config(&config, &state)?;

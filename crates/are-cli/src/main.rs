@@ -280,9 +280,10 @@ enum ProcAction {
         /// Process ID
         id: String,
 
-        /// Timeout in seconds (daemon caps at 3600)
-        #[arg(long)]
-        timeout: Option<u64>,
+        /// Timeout in seconds, 1..=3600 (daemon requires an explicit
+        /// timeout; indefinite waits are rejected).
+        #[arg(long, default_value = "30")]
+        timeout: u64,
     },
 
     /// Terminate a process

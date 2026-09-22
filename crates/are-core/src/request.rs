@@ -212,12 +212,30 @@ pub struct ListDirectoryResponse {
 // Execute (Gate 5 — stable API)
 // ---------------------------------------------------------------------------
 
+/// Maximum number of arguments accepted in an [`ExecuteRequest`].
+pub const MAX_EXEC_ARGS: usize = 256;
+/// Maximum length in bytes of a single argument.
+pub const MAX_EXEC_ARG_LEN: usize = 32 * 1024;
+/// Maximum number of environment variables accepted in an
+/// [`ExecuteRequest`].
+pub const MAX_EXEC_ENV_VARS: usize = 128;
+/// Maximum length in bytes of a single env var key.
+pub const MAX_EXEC_ENV_KEY_LEN: usize = 4 * 1024;
+/// Maximum length in bytes of a single env var value.
+pub const MAX_EXEC_ENV_VALUE_LEN: usize = 1024 * 1024;
+
 /// Request to execute a process in the environment.
 ///
 /// Uses structured execution (no shell string interpolation) per the
 /// project's non-negotiable design rules. There is deliberately no
 /// `execute_shell("arbitrary string")`: `program` is spawned directly
 /// without shell metacharacter interpretation.
+///
+/// Request-size bounds (enforced by [`ExecuteRequest::validate`]) keep a
+/// single request from forcing unbounded daemon allocations:
+/// at most [`MAX_EXEC_ARGS`] args of [`MAX_EXEC_ARG_LEN`] bytes each, and
+/// at most [`MAX_EXEC_ENV_VARS`] env vars with keys/values capped at
+/// [`MAX_EXEC_ENV_KEY_LEN`]/[`MAX_EXEC_ENV_VALUE_LEN`] bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecuteRequest {
     pub environment_id: EnvironmentId,
@@ -233,8 +251,13 @@ pub struct ExecuteRequest {
 }
 
 impl ExecuteRequest {
-    /// Upper bound for env var names/values is enforced by the daemon's
-    /// process manager; this only checks structural validity.
+    /// Validate structural shape plus request-size bounds.
+    ///
+    /// Rejects oversized arg/env payloads (see `MAX_EXEC_*`), NUL bytes,
+    /// malformed env keys, and a client-supplied `PATH` (the daemon
+    /// resolves programs against its own trusted `PATH`; accepting a
+    /// client `PATH` would let callers redirect bare program names at
+    /// attacker-controlled directories).
     pub fn validate(&self) -> Result<(), crate::CoreError> {
         if self.program.is_empty() {
             return Err(crate::CoreError::InvalidRequest(
@@ -251,12 +274,29 @@ impl ExecuteRequest {
                 "working_directory must not be empty".into(),
             ));
         }
+        if self.args.len() > MAX_EXEC_ARGS {
+            return Err(crate::CoreError::InvalidRequest(format!(
+                "too many args: {} exceeds maximum {MAX_EXEC_ARGS}",
+                self.args.len()
+            )));
+        }
         for arg in &self.args {
             if arg.contains('\0') {
                 return Err(crate::CoreError::InvalidRequest(
                     "args must not contain NUL".into(),
                 ));
             }
+            if arg.len() > MAX_EXEC_ARG_LEN {
+                return Err(crate::CoreError::InvalidRequest(format!(
+                    "arg exceeds maximum length {MAX_EXEC_ARG_LEN}"
+                )));
+            }
+        }
+        if self.env_vars.len() > MAX_EXEC_ENV_VARS {
+            return Err(crate::CoreError::InvalidRequest(format!(
+                "too many env vars: {} exceeds maximum {MAX_EXEC_ENV_VARS}",
+                self.env_vars.len()
+            )));
         }
         for (key, value) in &self.env_vars {
             if key.is_empty() {
@@ -269,10 +309,25 @@ impl ExecuteRequest {
                     "invalid env var key: {key:?}"
                 )));
             }
+            if key.len() > MAX_EXEC_ENV_KEY_LEN {
+                return Err(crate::CoreError::InvalidRequest(format!(
+                    "env var key {key:?} exceeds maximum length {MAX_EXEC_ENV_KEY_LEN}"
+                )));
+            }
+            if value.len() > MAX_EXEC_ENV_VALUE_LEN {
+                return Err(crate::CoreError::InvalidRequest(format!(
+                    "env var value for {key:?} exceeds maximum length {MAX_EXEC_ENV_VALUE_LEN}"
+                )));
+            }
             if value.contains('\0') {
                 return Err(crate::CoreError::InvalidRequest(format!(
                     "env var value for {key:?} must not contain NUL"
                 )));
+            }
+            if key == "PATH" {
+                return Err(crate::CoreError::InvalidRequest(
+                    "env var PATH must not be supplied: programs resolve against the daemon's trusted PATH".into(),
+                ));
             }
         }
         Ok(())
@@ -333,6 +388,9 @@ pub struct TerminateProcessResponse {
 // WaitProcess (Gate 5 — stable API)
 // ---------------------------------------------------------------------------
 
+/// Minimum `timeout_secs` accepted by [`WaitProcessRequest`].
+pub const MIN_WAIT_TIMEOUT_SECS: u64 = 1;
+
 /// Maximum `timeout_secs` accepted by [`WaitProcessRequest`].
 pub const MAX_WAIT_TIMEOUT_SECS: u64 = 3600;
 
@@ -340,24 +398,31 @@ pub const MAX_WAIT_TIMEOUT_SECS: u64 = 3600;
 ///
 /// Blocks until the process exits or the timeout elapses, then returns a
 /// snapshot of the capped captured output.
+///
+/// The timeout is **required** (`1..=3600` seconds): indefinite waits are
+/// rejected because a single-request transport must always make progress.
+/// There is no `None`/infinite variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitProcessRequest {
     pub environment_id: EnvironmentId,
     pub process_id: ProcessId,
-    /// Maximum seconds to wait. `None` waits indefinitely (the daemon's
-    /// configured default applies; callers behind a single-request
-    /// connection should prefer an explicit timeout).
-    pub timeout_secs: Option<u64>,
+    /// Maximum seconds to wait, `1..=3600`.
+    pub timeout_secs: u64,
 }
 
 impl WaitProcessRequest {
     pub fn validate(&self) -> Result<(), crate::CoreError> {
-        if let Some(timeout) = self.timeout_secs {
-            if timeout > MAX_WAIT_TIMEOUT_SECS {
-                return Err(crate::CoreError::InvalidRequest(format!(
-                    "timeout_secs {timeout} exceeds maximum {MAX_WAIT_TIMEOUT_SECS}"
-                )));
-            }
+        if self.timeout_secs < MIN_WAIT_TIMEOUT_SECS {
+            return Err(crate::CoreError::InvalidRequest(format!(
+                "timeout_secs {} is below minimum {MIN_WAIT_TIMEOUT_SECS}: wait requires an explicit timeout",
+                self.timeout_secs
+            )));
+        }
+        if self.timeout_secs > MAX_WAIT_TIMEOUT_SECS {
+            return Err(crate::CoreError::InvalidRequest(format!(
+                "timeout_secs {} exceeds maximum {MAX_WAIT_TIMEOUT_SECS}",
+                self.timeout_secs
+            )));
         }
         Ok(())
     }
@@ -550,22 +615,74 @@ mod tests {
     }
 
     #[test]
+    fn execute_validate_rejects_oversized_payloads() {
+        let base = || ExecuteRequest {
+            environment_id: eid(),
+            program: "cargo".into(),
+            args: vec![],
+            working_directory: "/workspace".into(),
+            env_vars: HashMap::new(),
+        };
+        // Too many args.
+        let mut req = base();
+        req.args = vec!["a".into(); MAX_EXEC_ARGS + 1];
+        assert!(req.validate().is_err());
+        // Arg at the bound is fine; one byte over is not.
+        let mut req = base();
+        req.args = vec!["a".repeat(MAX_EXEC_ARG_LEN)];
+        assert!(req.validate().is_ok());
+        let mut req = base();
+        req.args = vec!["a".repeat(MAX_EXEC_ARG_LEN + 1)];
+        assert!(req.validate().is_err());
+        // Too many env vars.
+        let mut req = base();
+        for i in 0..=MAX_EXEC_ENV_VARS {
+            req.env_vars.insert(format!("K{i}"), "v".into());
+        }
+        assert!(req.validate().is_err());
+        // Oversized key / value.
+        let mut req = base();
+        req.env_vars
+            .insert("k".repeat(MAX_EXEC_ENV_KEY_LEN + 1), "v".into());
+        assert!(req.validate().is_err());
+        let mut req = base();
+        req.env_vars
+            .insert("K".into(), "v".repeat(MAX_EXEC_ENV_VALUE_LEN + 1));
+        assert!(req.validate().is_err());
+        // Boundary values are accepted.
+        let mut req = base();
+        req.env_vars.insert(
+            "k".repeat(MAX_EXEC_ENV_KEY_LEN),
+            "v".repeat(MAX_EXEC_ENV_VALUE_LEN),
+        );
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn execute_validate_rejects_client_supplied_path() {
+        let mut req = ExecuteRequest {
+            environment_id: eid(),
+            program: "cargo".into(),
+            args: vec![],
+            working_directory: "/workspace".into(),
+            env_vars: HashMap::new(),
+        };
+        req.env_vars.insert("PATH".into(), "/tmp/evil".into());
+        let err = req.validate().unwrap_err();
+        assert!(format!("{err}").contains("PATH"));
+    }
+
+    #[test]
     fn wait_validate_timeout_bounds() {
-        let base = || WaitProcessRequest {
+        let base = |timeout: u64| WaitProcessRequest {
             environment_id: eid(),
             process_id: pid(),
-            timeout_secs: None,
+            timeout_secs: timeout,
         };
-        assert!(base().validate().is_ok());
-        let mut req = base();
-        req.timeout_secs = Some(0);
-        assert!(req.validate().is_ok());
-        let mut req = base();
-        req.timeout_secs = Some(MAX_WAIT_TIMEOUT_SECS);
-        assert!(req.validate().is_ok());
-        let mut req = base();
-        req.timeout_secs = Some(MAX_WAIT_TIMEOUT_SECS + 1);
-        assert!(req.validate().is_err());
+        assert!(base(0).validate().is_err());
+        assert!(base(MIN_WAIT_TIMEOUT_SECS).validate().is_ok());
+        assert!(base(MAX_WAIT_TIMEOUT_SECS).validate().is_ok());
+        assert!(base(MAX_WAIT_TIMEOUT_SECS + 1).validate().is_err());
     }
 
     // ---- Serialization roundtrips ----
@@ -722,7 +839,7 @@ mod tests {
         let req = WaitProcessRequest {
             environment_id: eid(),
             process_id: pid(),
-            timeout_secs: Some(30),
+            timeout_secs: 30,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: WaitProcessRequest = serde_json::from_str(&json).unwrap();
