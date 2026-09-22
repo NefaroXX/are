@@ -85,3 +85,38 @@ policy denies fail closed, injection is literal, workdir confinement matches
 Gate 4 boundaries, lifecycle (run/status/wait/kill) works across fresh
 connections, oversized responses degrade to clean errors, and restart
 semantics are exactly as documented (memory-only table, orphans possible).
+
+---
+
+# Gate 6 (Agent Sessions) — same target, Gate 6 `ared` release build
+
+**Daemon:** rebuilt on-target with Gate 6 (`session.rs`, kill-on-expiry,
+CSPRNG sess ids), `--allow-exec echo,uname,sleep,cat,cargo,ls,false,env`.
+
+Remote suite on target: **259 passed, 0 failed** (incl. unix-only session
+spawn tests that never run on Windows).
+
+## Results
+
+| # | Scenario | Command / observation | Result |
+|---|----------|----------------------|--------|
+| 1 | Create + resume | `sess create --workdir subdir --env FOO=bar` → id `sess-<32hex>`; `sess show` from a fresh TLS connection | ✅ workdir `subdir` + `FOO=bar` intact across reconnect |
+| 2 | List | `sess list` | ✅ live session listed with workdir/env/created/last-active |
+| 3 | Workdir inheritance | `proc run --session <id> --program ls` (no `--workdir`) | ✅ listed `nested.txt` (session dir `subdir` honored) |
+| 4 | Env inheritance | `proc run --session <id> --program env` | ✅ `FOO=bar` visible; `PATH` = daemon trusted value; no `LD_*` lines |
+| 5 | Isolation | second session; `proc status --session <other> <pid>` | ✅ `not found: unknown process id` (no leak, no oracle) |
+| 6 | Explicit binding | `proc run` without `--session` | ✅ clap rejects: `--session <SESSION>` required |
+| 7 | Cascade terminate | `sess rm <id>` with live `sleep` | ✅ `terminated session (1 processes reaped)`; later `status` → `session not found` |
+| 8 | Idle expiry (live) | daemon restarted with `--session-idle-timeout 5`; create → sleep 9s → `show` → `show` again | ✅ first `session expired`, second `session not found` (one-shot lazy expiry, entry removed) |
+
+Daemon left running with default timeouts + full allowlist; fixtures
+pristine. Orphan-on-expiry kill path is unit/integration-tested (live procs
+reaped on expiry touch); the deliberate expiry run above had no live procs.
+
+## Conclusion
+
+Sessions are genuinely first-class on real hardware: create once, resume from
+any fresh connection by id, with workdir + env traveling along; processes are
+bound to sessions; expiry and cascade behave exactly as documented. This is
+already a sharper tool than SSH for agent workflows — no shell quoting, no
+`cd` state to lose, no ambient authority.
