@@ -4,21 +4,24 @@
 //! knowledge of SSH, TCP, TLS, or HTTP. Implementations map these to
 //! whatever wire format the transport uses.
 //!
-//! # Public API surface (Gate 3.5)
+//! # Public API surface (Gate 5)
 //!
-//! Only `ReadFile` and `ListDirectory` are part of the stable public API.
-//! `WriteFile`, `Execute`, `ProcessStatus`, and `TerminateProcess` are
-//! gated behind `#[cfg(any(test, feature = "future"))]` and not re-exported
-//! from the crate root. They belong to future gates (5 and 7).
+//! `ReadFile`, `ListDirectory`, `GetFileMetadata`, `Execute`,
+//! `ProcessStatus`, `TerminateProcess`, and `WaitProcess` are part of the
+//! stable public API. `WriteFile` remains gated behind
+//! `#[cfg(any(test, feature = "future"))]` and is not re-exported from the
+//! crate root. It belongs to Gate 7.
+//!
+//! Processes are keyed by `(environment_id, process_id)` in daemon memory.
+//! Sessions do not exist yet (Gate 6 will bind processes to sessions);
+//! no session types are introduced here.
 
-#[cfg(any(test, feature = "future"))]
 use std::collections::HashMap;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
 use crate::EnvironmentId;
-#[cfg(any(test, feature = "future"))]
 use crate::ProcessId;
 
 // ---------------------------------------------------------------------------
@@ -51,18 +54,17 @@ pub struct DirectoryEntry {
 }
 
 /// Current state of a process.
-///
-/// **Not part of the public API.** Gated behind `feature = "future"`.
-#[cfg(any(test, feature = "future"))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessState {
     /// The process is still running.
     Running,
-    /// The process exited with the given exit code.
+    /// The process exited with the given exit code (including non-zero
+    /// crashes — any exit observed via `wait()` maps here).
     Exited { code: i32 },
-    /// The process terminated abnormally with the given signal/code.
-    Failed { code: i32 },
+    /// The process never produced an exit code: it failed to spawn, was
+    /// killed by a signal, or the daemon lost track of it.
+    Failed { message: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +110,7 @@ pub struct ReadFileResponse {
 /// Request to write a file to the environment.
 ///
 /// **Not part of the public API.** Gated behind `feature = "future"`.
-/// Will become stable in Gate 5.
+/// Will become stable in Gate 7.
 #[cfg(any(test, feature = "future"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteFileRequest {
@@ -207,17 +209,15 @@ pub struct ListDirectoryResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Execute (Future gate — not part of stable API)
+// Execute (Gate 5 — stable API)
 // ---------------------------------------------------------------------------
 
 /// Request to execute a process in the environment.
 ///
 /// Uses structured execution (no shell string interpolation) per the
-/// project's non-negotiable design rules.
-///
-/// **Not part of the public API.** Gated behind `feature = "future"`.
-/// Will become stable in Gate 7.
-#[cfg(any(test, feature = "future"))]
+/// project's non-negotiable design rules. There is deliberately no
+/// `execute_shell("arbitrary string")`: `program` is spawned directly
+/// without shell metacharacter interpretation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecuteRequest {
     pub environment_id: EnvironmentId,
@@ -232,12 +232,18 @@ pub struct ExecuteRequest {
     pub env_vars: HashMap<String, String>,
 }
 
-#[cfg(any(test, feature = "future"))]
 impl ExecuteRequest {
+    /// Upper bound for env var names/values is enforced by the daemon's
+    /// process manager; this only checks structural validity.
     pub fn validate(&self) -> Result<(), crate::CoreError> {
         if self.program.is_empty() {
             return Err(crate::CoreError::InvalidRequest(
                 "program must not be empty".into(),
+            ));
+        }
+        if self.program.contains('\0') {
+            return Err(crate::CoreError::InvalidRequest(
+                "program must not contain NUL".into(),
             ));
         }
         if self.working_directory.is_empty() {
@@ -245,14 +251,35 @@ impl ExecuteRequest {
                 "working_directory must not be empty".into(),
             ));
         }
+        for arg in &self.args {
+            if arg.contains('\0') {
+                return Err(crate::CoreError::InvalidRequest(
+                    "args must not contain NUL".into(),
+                ));
+            }
+        }
+        for (key, value) in &self.env_vars {
+            if key.is_empty() {
+                return Err(crate::CoreError::InvalidRequest(
+                    "env var key must not be empty".into(),
+                ));
+            }
+            if key.contains('=') || key.contains('\0') {
+                return Err(crate::CoreError::InvalidRequest(format!(
+                    "invalid env var key: {key:?}"
+                )));
+            }
+            if value.contains('\0') {
+                return Err(crate::CoreError::InvalidRequest(format!(
+                    "env var value for {key:?} must not contain NUL"
+                )));
+            }
+        }
         Ok(())
     }
 }
 
 /// Response from executing a process.
-///
-/// **Not part of the public API.** Gated behind `feature = "future"`.
-#[cfg(any(test, feature = "future"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecuteResponse {
     /// Identifier of the created process.
@@ -260,13 +287,10 @@ pub struct ExecuteResponse {
 }
 
 // ---------------------------------------------------------------------------
-// ProcessStatus (Future gate — not part of stable API)
+// ProcessStatus (Gate 5 — stable API)
 // ---------------------------------------------------------------------------
 
 /// Request to query process status.
-///
-/// **Not part of the public API.** Gated behind `feature = "future"`.
-#[cfg(any(test, feature = "future"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessStatusRequest {
     pub environment_id: EnvironmentId,
@@ -274,38 +298,85 @@ pub struct ProcessStatusRequest {
 }
 
 /// Response containing process status.
-///
-/// **Not part of the public API.** Gated behind `feature = "future"`.
-#[cfg(any(test, feature = "future"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessStatusResponse {
     pub state: ProcessState,
 }
 
 // ---------------------------------------------------------------------------
-// TerminateProcess (Future gate — not part of stable API)
+// TerminateProcess (Gate 5 — stable API)
 // ---------------------------------------------------------------------------
 
 /// Request to terminate a process.
 ///
-/// **Not part of the public API.** Gated behind `feature = "future"`.
-#[cfg(any(test, feature = "future"))]
+/// Gate 5 has no SIGTERM/SIGKILL distinction yet (both terminate
+/// forcefully; see the daemon's process manager). The `force` flag is
+/// accepted for forward compatibility with Gate 12 (signals).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminateProcessRequest {
     pub environment_id: EnvironmentId,
     pub process_id: ProcessId,
-    /// If `true`, send `SIGKILL`; otherwise send `SIGTERM`.
+    /// If `true`, force-kill; otherwise terminate gracefully.
+    /// Currently both paths are forceful — documented, not silent.
     pub force: bool,
 }
 
 /// Response from terminating a process.
-///
-/// **Not part of the public API.** Gated behind `feature = "future"`.
-#[cfg(any(test, feature = "future"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminateProcessResponse {
     /// Whether the process was successfully terminated.
+    /// `false` means it had already exited.
     pub terminated: bool,
+}
+
+// ---------------------------------------------------------------------------
+// WaitProcess (Gate 5 — stable API)
+// ---------------------------------------------------------------------------
+
+/// Maximum `timeout_secs` accepted by [`WaitProcessRequest`].
+pub const MAX_WAIT_TIMEOUT_SECS: u64 = 3600;
+
+/// Request to wait for a process to exit, up to a timeout.
+///
+/// Blocks until the process exits or the timeout elapses, then returns a
+/// snapshot of the capped captured output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitProcessRequest {
+    pub environment_id: EnvironmentId,
+    pub process_id: ProcessId,
+    /// Maximum seconds to wait. `None` waits indefinitely (the daemon's
+    /// configured default applies; callers behind a single-request
+    /// connection should prefer an explicit timeout).
+    pub timeout_secs: Option<u64>,
+}
+
+impl WaitProcessRequest {
+    pub fn validate(&self) -> Result<(), crate::CoreError> {
+        if let Some(timeout) = self.timeout_secs {
+            if timeout > MAX_WAIT_TIMEOUT_SECS {
+                return Err(crate::CoreError::InvalidRequest(format!(
+                    "timeout_secs {timeout} exceeds maximum {MAX_WAIT_TIMEOUT_SECS}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Response from waiting on a process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitProcessResponse {
+    /// Captured stdout, capped by the daemon's per-stream output limit.
+    pub stdout: Vec<u8>,
+    /// Captured stderr, capped by the daemon's per-stream output limit.
+    pub stderr: Vec<u8>,
+    /// Exit code if the process exited normally. `None` when the wait
+    /// timed out or the process failed without an exit code.
+    pub exit_code: Option<i32>,
+    /// `true` if the timeout elapsed before the process exited.
+    pub timed_out: bool,
+    /// `true` if output exceeded the daemon's cap and was truncated.
+    pub truncated: bool,
 }
 
 #[cfg(test)]
@@ -446,6 +517,57 @@ mod tests {
         assert!(req.validate().is_err());
     }
 
+    #[test]
+    fn execute_validate_rejects_bad_env_keys() {
+        let base = || ExecuteRequest {
+            environment_id: eid(),
+            program: "cargo".into(),
+            args: vec![],
+            working_directory: "/workspace".into(),
+            env_vars: HashMap::new(),
+        };
+        // Empty key.
+        let mut req = base();
+        req.env_vars.insert(String::new(), "v".into());
+        assert!(req.validate().is_err());
+        // Key containing '='.
+        let mut req = base();
+        req.env_vars.insert("A=B".into(), "v".into());
+        assert!(req.validate().is_err());
+        // NUL in key / value / arg / program.
+        let mut req = base();
+        req.env_vars.insert("A\0".into(), "v".into());
+        assert!(req.validate().is_err());
+        let mut req = base();
+        req.env_vars.insert("A".into(), "v\0".into());
+        assert!(req.validate().is_err());
+        let mut req = base();
+        req.args.push("a\0".into());
+        assert!(req.validate().is_err());
+        let mut req = base();
+        req.program = "a\0".into();
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn wait_validate_timeout_bounds() {
+        let base = || WaitProcessRequest {
+            environment_id: eid(),
+            process_id: pid(),
+            timeout_secs: None,
+        };
+        assert!(base().validate().is_ok());
+        let mut req = base();
+        req.timeout_secs = Some(0);
+        assert!(req.validate().is_ok());
+        let mut req = base();
+        req.timeout_secs = Some(MAX_WAIT_TIMEOUT_SECS);
+        assert!(req.validate().is_ok());
+        let mut req = base();
+        req.timeout_secs = Some(MAX_WAIT_TIMEOUT_SECS + 1);
+        assert!(req.validate().is_err());
+    }
+
     // ---- Serialization roundtrips ----
 
     #[test]
@@ -564,7 +686,9 @@ mod tests {
         let states = [
             ProcessState::Running,
             ProcessState::Exited { code: 0 },
-            ProcessState::Failed { code: 137 },
+            ProcessState::Failed {
+                message: "spawn failed".into(),
+            },
         ];
         for state in &states {
             let resp = ProcessStatusResponse {
@@ -590,6 +714,29 @@ mod tests {
         let resp = TerminateProcessResponse { terminated: true };
         let json = serde_json::to_string(&resp).unwrap();
         let back: TerminateProcessResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn wait_roundtrip() {
+        let req = WaitProcessRequest {
+            environment_id: eid(),
+            process_id: pid(),
+            timeout_secs: Some(30),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: WaitProcessRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+
+        let resp = WaitProcessResponse {
+            stdout: b"out".to_vec(),
+            stderr: b"err".to_vec(),
+            exit_code: Some(0),
+            timed_out: false,
+            truncated: false,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: WaitProcessResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(resp, back);
     }
 }

@@ -18,6 +18,7 @@
 pub mod framing;
 pub mod fs;
 pub mod handler;
+pub mod process;
 pub mod server;
 pub mod tls;
 
@@ -41,6 +42,12 @@ pub struct DaemonConfig {
     /// Allowed root directory for filesystem operations.
     /// If None, defaults to the current working directory.
     pub allowed_root: Option<std::path::PathBuf>,
+    /// Allowed program basenames for process execution (Gate 5 allow list).
+    /// `None` means permissive development mode: any non-denied program may
+    /// run (with a warning logged per spawn). The deny list
+    /// (shutdown/reboot/poweroff/halt/init) is always enforced and is not
+    /// configurable here.
+    pub allowed_executables: Option<Vec<String>>,
 }
 
 impl Default for DaemonConfig {
@@ -53,6 +60,7 @@ impl Default for DaemonConfig {
             server_key_path: None,
             client_ca_path: None,
             allowed_root: None,
+            allowed_executables: None,
         }
     }
 }
@@ -84,11 +92,17 @@ pub fn build_daemon_state(config: &DaemonConfig) -> crate::handler::DaemonState 
     let platform = detect_platform(&operating_system);
 
     let mut advertised_capabilities = CapabilitySet::default();
-    // Gate 4: advertise only capabilities with enforceable handlers.
+    // Gate 5: advertise only capabilities with enforceable handlers.
     // read_file → FilesystemRead, list_directory → FilesystemList,
     // file_metadata is an attribute read and maps to FilesystemRead.
+    // execute → ProcessExecute, process_status → ProcessInspect,
+    // terminate_process/wait_process → ProcessTerminate.
+    // FilesystemWrite stays OUT (Gate 7).
     advertised_capabilities.insert(are_core::Capability::FilesystemRead);
     advertised_capabilities.insert(are_core::Capability::FilesystemList);
+    advertised_capabilities.insert(are_core::Capability::ProcessExecute);
+    advertised_capabilities.insert(are_core::Capability::ProcessInspect);
+    advertised_capabilities.insert(are_core::Capability::ProcessTerminate);
 
     // Build filesystem backend if allowed_root is configured.
     let fs = config.allowed_root.as_ref().and_then(|root| {
@@ -101,6 +115,18 @@ pub fn build_daemon_state(config: &DaemonConfig) -> crate::handler::DaemonState 
         }
     });
 
+    // Build the process manager: same environment binding, same filesystem
+    // resolver for working-directory confinement, allow list from config.
+    let mut proc_config = crate::process::ProcessConfig::default();
+    if let Some(allowed) = &config.allowed_executables {
+        proc_config.allowed_executables = Some(allowed.iter().cloned().collect());
+    }
+    let proc_manager = std::sync::Arc::new(crate::process::ProcessManager::new(
+        config.environment_id.clone(),
+        proc_config,
+        fs.clone(),
+    ));
+
     let mut state = crate::handler::DaemonState::new(
         config.environment_id.clone(),
         machine_name,
@@ -109,6 +135,7 @@ pub fn build_daemon_state(config: &DaemonConfig) -> crate::handler::DaemonState 
         platform,
     );
     state.fs = fs;
+    state.proc = Some(proc_manager);
     state
 }
 
@@ -168,7 +195,7 @@ pub fn run(_config: DaemonConfig) -> Result<(), DaemonError> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
 
@@ -205,27 +232,27 @@ mod tests {
     fn build_daemon_state_has_all_capabilities() {
         let config = DaemonConfig::default();
         let state = build_daemon_state(&config);
-        // Gate 4: only capabilities with enforceable handlers are advertised.
+        // Gate 5: only capabilities with enforceable handlers are advertised.
         assert!(state
             .advertised_capabilities
             .contains(&are_core::Capability::FilesystemRead));
         assert!(state
             .advertised_capabilities
             .contains(&are_core::Capability::FilesystemList));
-        // Write and process capabilities are NOT advertised (not yet implemented).
+        assert!(state
+            .advertised_capabilities
+            .contains(&are_core::Capability::ProcessExecute));
+        assert!(state
+            .advertised_capabilities
+            .contains(&are_core::Capability::ProcessInspect));
+        assert!(state
+            .advertised_capabilities
+            .contains(&are_core::Capability::ProcessTerminate));
+        // FilesystemWrite is NOT advertised (Gate 7).
         assert!(!state
             .advertised_capabilities
             .contains(&are_core::Capability::FilesystemWrite));
-        assert!(!state
-            .advertised_capabilities
-            .contains(&are_core::Capability::ProcessExecute));
-        assert!(!state
-            .advertised_capabilities
-            .contains(&are_core::Capability::ProcessInspect));
-        assert!(!state
-            .advertised_capabilities
-            .contains(&are_core::Capability::ProcessTerminate));
-        assert_eq!(state.advertised_capabilities.len(), 2);
+        assert_eq!(state.advertised_capabilities.len(), 5);
     }
 
     #[test]
@@ -244,5 +271,32 @@ mod tests {
         let config = DaemonConfig::default();
         let state = build_daemon_state(&config);
         assert!(state.fs.is_none());
+    }
+
+    #[test]
+    fn build_daemon_state_wires_process_manager() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = DaemonConfig {
+            allowed_root: Some(tmp.path().to_path_buf()),
+            allowed_executables: Some(vec!["cargo".into(), "git".into()]),
+            ..Default::default()
+        };
+        let state = build_daemon_state(&config);
+        let proc = state.proc.expect("process manager must be wired");
+        let allowed = proc
+            .config()
+            .allowed_executables
+            .as_ref()
+            .expect("allow list must be set");
+        assert!(allowed.contains("cargo"));
+        assert!(allowed.contains("git"));
+    }
+
+    #[test]
+    fn build_daemon_state_process_manager_without_allow_list() {
+        let config = DaemonConfig::default();
+        let state = build_daemon_state(&config);
+        let proc = state.proc.expect("process manager must be wired");
+        assert!(proc.config().allowed_executables.is_none());
     }
 }

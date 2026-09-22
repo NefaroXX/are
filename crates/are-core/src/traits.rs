@@ -22,8 +22,9 @@ use async_trait::async_trait;
 /// remote, and future container implementations. No implementation may
 /// silently fall back to local execution.
 ///
-/// Only `read_file` and `list_directory` are part of the stable API (Gate 3.5).
-/// The remaining methods are gated behind `feature = "future"`.
+/// Only `write_file` remains gated behind `feature = "future"` (Gate 7).
+/// Process operations (`execute`, `process_status`, `terminate_process`,
+/// `wait_process`) are stable as of Gate 5.
 #[async_trait]
 #[allow(dead_code)]
 pub trait Environment: Send + Sync {
@@ -46,23 +47,27 @@ pub trait Environment: Send + Sync {
         req: GetFileMetadataRequest,
     ) -> Result<GetFileMetadataResponse, CoreError>;
 
-    /// Execute a process in the environment.
-    #[cfg(any(test, feature = "future"))]
+    /// Execute a process in the environment (structured, no shell).
     async fn execute(&self, req: ExecuteRequest) -> Result<ExecuteResponse, CoreError>;
 
     /// Query the status of a running or completed process.
-    #[cfg(any(test, feature = "future"))]
     async fn process_status(
         &self,
         req: ProcessStatusRequest,
     ) -> Result<ProcessStatusResponse, CoreError>;
 
-    /// Terminate a process (SIGTERM) or force-kill it (SIGKILL).
-    #[cfg(any(test, feature = "future"))]
+    /// Terminate a process. The `force` flag selects force-kill vs
+    /// graceful termination where the backend distinguishes them
+    /// (Gate 5 backends are forceful on both paths — documented).
     async fn terminate_process(
         &self,
         req: TerminateProcessRequest,
     ) -> Result<TerminateProcessResponse, CoreError>;
+
+    /// Wait for a process to exit, up to a timeout, returning the
+    /// capped captured output.
+    async fn wait_process(&self, req: WaitProcessRequest)
+        -> Result<WaitProcessResponse, CoreError>;
 }
 
 #[cfg(test)]
@@ -100,7 +105,6 @@ mod tests {
                 },
             })
         }
-
         async fn list_directory(
             &self,
             _req: ListDirectoryRequest,
@@ -122,14 +126,12 @@ mod tests {
             })
         }
 
-        #[cfg(any(test, feature = "future"))]
         async fn execute(&self, _req: ExecuteRequest) -> Result<ExecuteResponse, CoreError> {
             Ok(ExecuteResponse {
                 process_id: ProcessId::new("mock-proc"),
             })
         }
 
-        #[cfg(any(test, feature = "future"))]
         async fn process_status(
             &self,
             _req: ProcessStatusRequest,
@@ -139,12 +141,24 @@ mod tests {
             })
         }
 
-        #[cfg(any(test, feature = "future"))]
         async fn terminate_process(
             &self,
             _req: TerminateProcessRequest,
         ) -> Result<TerminateProcessResponse, CoreError> {
             Ok(TerminateProcessResponse { terminated: true })
+        }
+
+        async fn wait_process(
+            &self,
+            _req: WaitProcessRequest,
+        ) -> Result<WaitProcessResponse, CoreError> {
+            Ok(WaitProcessResponse {
+                stdout: b"mock".to_vec(),
+                stderr: vec![],
+                exit_code: Some(0),
+                timed_out: false,
+                truncated: false,
+            })
         }
     }
 

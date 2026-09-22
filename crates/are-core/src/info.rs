@@ -11,8 +11,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CapabilitySet, CoreError, EnvironmentId, GetFileMetadataRequest, GetFileMetadataResponse,
-    ListDirectoryRequest, ListDirectoryResponse, Platform, ReadFileRequest, ReadFileResponse,
+    CapabilitySet, CoreError, EnvironmentId, ExecuteRequest, ExecuteResponse,
+    GetFileMetadataRequest, GetFileMetadataResponse, ListDirectoryRequest, ListDirectoryResponse,
+    Platform, ProcessStatusRequest, ProcessStatusResponse, ReadFileRequest, ReadFileResponse,
+    TerminateProcessRequest, TerminateProcessResponse, WaitProcessRequest, WaitProcessResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -90,6 +92,18 @@ pub enum RpcRequest {
     /// Get file/directory metadata.
     #[serde(rename = "get_file_metadata")]
     GetFileMetadata(GetFileMetadataRequest),
+    /// Execute a process (structured execution, no shell).
+    #[serde(rename = "execute")]
+    Execute(ExecuteRequest),
+    /// Query process status.
+    #[serde(rename = "process_status")]
+    ProcessStatus(ProcessStatusRequest),
+    /// Terminate a process.
+    #[serde(rename = "terminate_process")]
+    TerminateProcess(TerminateProcessRequest),
+    /// Wait for a process to exit, up to a timeout.
+    #[serde(rename = "wait_process")]
+    WaitProcess(WaitProcessRequest),
 }
 
 /// An RPC response wrapping a typed result.
@@ -115,6 +129,18 @@ pub enum RpcResponsePayload {
     /// File metadata response.
     #[serde(rename = "get_file_metadata")]
     GetFileMetadata(GetFileMetadataResponse),
+    /// Process creation response.
+    #[serde(rename = "execute")]
+    Execute(ExecuteResponse),
+    /// Process status response.
+    #[serde(rename = "process_status")]
+    ProcessStatus(ProcessStatusResponse),
+    /// Process termination response.
+    #[serde(rename = "terminate_process")]
+    TerminateProcess(TerminateProcessResponse),
+    /// Process wait response (capped captured output).
+    #[serde(rename = "wait_process")]
+    WaitProcess(WaitProcessResponse),
 }
 
 /// RPC-level error, distinct from `CoreError` (which is domain-level).
@@ -131,6 +157,18 @@ pub enum RpcError {
     /// The daemon does not recognize this request type.
     #[error("unknown request type: {0}")]
     UnknownRequestType(String),
+
+    /// The requested process (or other resource) does not exist.
+    /// Distinct from `InternalError` so clients can distinguish
+    /// "unknown id" from daemon failures.
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    /// The requested executable is denied by the daemon's execution policy.
+    /// Distinct from `InvalidRequest` so clients can distinguish policy
+    /// rejection from malformed requests.
+    #[error("executable denied by policy: {0}")]
+    DeniedExecutable(String),
 
     /// An internal daemon error occurred.
     #[error("internal error: {0}")]
@@ -228,6 +266,18 @@ mod tests {
     }
 
     #[test]
+    fn rpc_error_new_variants_roundtrip() {
+        for err in [
+            RpcError::NotFound("proc-1".into()),
+            RpcError::DeniedExecutable("shutdown".into()),
+        ] {
+            let json = serde_json::to_string(&err).unwrap();
+            let back: RpcError = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{err}"), format!("{back}"));
+        }
+    }
+
+    #[test]
     fn rpc_request_read_file_roundtrip() {
         let req = RpcRequest::ReadFile(ReadFileRequest {
             environment_id: EnvironmentId::new("dev"),
@@ -261,6 +311,88 @@ mod tests {
         let back: RpcRequest = serde_json::from_str(&json).unwrap();
         let json2 = serde_json::to_string(&back).unwrap();
         assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn rpc_request_execute_roundtrip() {
+        let req = RpcRequest::Execute(ExecuteRequest {
+            environment_id: EnvironmentId::new("dev"),
+            program: "cargo".into(),
+            args: vec!["test".into()],
+            working_directory: ".".into(),
+            env_vars: std::collections::HashMap::new(),
+        });
+        let json = serde_json::to_string(&req).unwrap();
+        let back: RpcRequest = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn rpc_request_process_status_roundtrip() {
+        let req = RpcRequest::ProcessStatus(ProcessStatusRequest {
+            environment_id: EnvironmentId::new("dev"),
+            process_id: crate::ProcessId::new("proc-1"),
+        });
+        let json = serde_json::to_string(&req).unwrap();
+        let back: RpcRequest = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn rpc_request_terminate_process_roundtrip() {
+        let req = RpcRequest::TerminateProcess(TerminateProcessRequest {
+            environment_id: EnvironmentId::new("dev"),
+            process_id: crate::ProcessId::new("proc-1"),
+            force: false,
+        });
+        let json = serde_json::to_string(&req).unwrap();
+        let back: RpcRequest = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn rpc_request_wait_process_roundtrip() {
+        let req = RpcRequest::WaitProcess(WaitProcessRequest {
+            environment_id: EnvironmentId::new("dev"),
+            process_id: crate::ProcessId::new("proc-1"),
+            timeout_secs: Some(30),
+        });
+        let json = serde_json::to_string(&req).unwrap();
+        let back: RpcRequest = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn rpc_response_process_roundtrip() {
+        let cases = [
+            RpcResponsePayload::Execute(ExecuteResponse {
+                process_id: crate::ProcessId::new("proc-1"),
+            }),
+            RpcResponsePayload::ProcessStatus(ProcessStatusResponse {
+                state: crate::ProcessState::Running,
+            }),
+            RpcResponsePayload::TerminateProcess(TerminateProcessResponse { terminated: true }),
+            RpcResponsePayload::WaitProcess(WaitProcessResponse {
+                stdout: b"out".to_vec(),
+                stderr: vec![],
+                exit_code: Some(0),
+                timed_out: false,
+                truncated: false,
+            }),
+        ];
+        for payload in cases {
+            let resp = RpcResponse {
+                result: Ok(payload),
+            };
+            let json = serde_json::to_string(&resp).unwrap();
+            let back: RpcResponse = serde_json::from_str(&json).unwrap();
+            let json2 = serde_json::to_string(&back).unwrap();
+            assert_eq!(json, json2);
+        }
     }
 
     #[test]

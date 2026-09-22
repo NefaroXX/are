@@ -157,6 +157,62 @@ impl SecureClient {
         }
     }
 
+    /// Start a process in the remote environment (structured, no shell).
+    pub async fn execute(
+        &self,
+        req: are_core::ExecuteRequest,
+    ) -> Result<are_core::ExecuteResponse, ConnectionError> {
+        let response = self.send_rpc(RpcRequest::Execute(req)).await?;
+
+        match response.result {
+            Ok(RpcResponsePayload::Execute(resp)) => Ok(resp),
+            Err(e) => Err(ConnectionError::RpcError(e.to_string())),
+            _ => Err(ConnectionError::UnexpectedResponse),
+        }
+    }
+
+    /// Query the status of a remote process.
+    pub async fn process_status(
+        &self,
+        req: are_core::ProcessStatusRequest,
+    ) -> Result<are_core::ProcessStatusResponse, ConnectionError> {
+        let response = self.send_rpc(RpcRequest::ProcessStatus(req)).await?;
+
+        match response.result {
+            Ok(RpcResponsePayload::ProcessStatus(resp)) => Ok(resp),
+            Err(e) => Err(ConnectionError::RpcError(e.to_string())),
+            _ => Err(ConnectionError::UnexpectedResponse),
+        }
+    }
+
+    /// Terminate a remote process.
+    pub async fn terminate_process(
+        &self,
+        req: are_core::TerminateProcessRequest,
+    ) -> Result<are_core::TerminateProcessResponse, ConnectionError> {
+        let response = self.send_rpc(RpcRequest::TerminateProcess(req)).await?;
+
+        match response.result {
+            Ok(RpcResponsePayload::TerminateProcess(resp)) => Ok(resp),
+            Err(e) => Err(ConnectionError::RpcError(e.to_string())),
+            _ => Err(ConnectionError::UnexpectedResponse),
+        }
+    }
+
+    /// Wait for a remote process to exit, up to a timeout.
+    pub async fn wait_process(
+        &self,
+        req: are_core::WaitProcessRequest,
+    ) -> Result<are_core::WaitProcessResponse, ConnectionError> {
+        let response = self.send_rpc(RpcRequest::WaitProcess(req)).await?;
+
+        match response.result {
+            Ok(RpcResponsePayload::WaitProcess(resp)) => Ok(resp),
+            Err(e) => Err(ConnectionError::RpcError(e.to_string())),
+            _ => Err(ConnectionError::UnexpectedResponse),
+        }
+    }
+
     /// Send an RPC request and return the response.
     async fn send_rpc(&self, request: RpcRequest) -> Result<RpcResponse, ConnectionError> {
         // Establish TCP connection.

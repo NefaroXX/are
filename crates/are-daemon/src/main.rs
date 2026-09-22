@@ -63,6 +63,14 @@ enum Commands {
         /// Defaults to the current working directory if not specified.
         #[arg(long)]
         allowed_root: Option<PathBuf>,
+
+        /// Comma-separated allow list of program basenames for process
+        /// execution (e.g. `--allow-exec cargo,git,npm,node,python`).
+        /// If omitted, any non-denied program may run (development mode,
+        /// with a warning logged per spawn). The deny list
+        /// (shutdown/reboot/poweroff/halt/init) is always enforced.
+        #[arg(long)]
+        allow_exec: Option<String>,
     },
 }
 
@@ -87,6 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             key,
             ca,
             allowed_root,
+            allow_exec,
         } => {
             let env_id = EnvironmentId::try_new(&environment_id)
                 .map_err(|e| format!("invalid environment_id: {e}"))?;
@@ -122,6 +131,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 server_key_path: key.as_ref().map(|p| p.display().to_string()),
                 client_ca_path: ca.as_ref().map(|p| p.display().to_string()),
                 allowed_root: root,
+                allowed_executables: allow_exec.map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                }),
             };
 
             let state = are_daemon::build_daemon_state(&config);

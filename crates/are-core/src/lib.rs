@@ -39,7 +39,10 @@ pub use info::{
 };
 pub use platform::Platform;
 pub use request::{
-    DirectoryEntry, FileMetadata, GetFileMetadataRequest, GetFileMetadataResponse,
-    ListDirectoryRequest, ListDirectoryResponse, ReadFileRequest, ReadFileResponse,
+    DirectoryEntry, ExecuteRequest, ExecuteResponse, FileMetadata, GetFileMetadataRequest,
+    GetFileMetadataResponse, ListDirectoryRequest, ListDirectoryResponse, ProcessState,
+    ProcessStatusRequest, ProcessStatusResponse, ReadFileRequest, ReadFileResponse,
+    TerminateProcessRequest, TerminateProcessResponse, WaitProcessRequest, WaitProcessResponse,
+    MAX_WAIT_TIMEOUT_SECS,
 };
 pub use traits::Environment as EnvironmentOps;
