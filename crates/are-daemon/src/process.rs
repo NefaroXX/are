@@ -34,7 +34,10 @@
 //! - **Bounded output.** Stdout/stderr are each capped at
 //!   `max_output_bytes` (default 8 MiB per stream). Excess bytes are
 //!   discarded and the `truncated` flag is set, so a verbose child cannot
-//!   exhaust daemon memory.
+//!   exhaust daemon memory. These caps bound memory, not the wire: the
+//!   transport-layer response-size guard (`framing::write_message_sized` →
+//!   clean `RpcError::InternalError`) is the backstop that keeps even two
+//!   full streams transmittable as a clean RPC error.
 //! - **Bounded process table.** At most `max_processes` entries (default
 //!   128) are retained. Spawning past the bound first evicts expired
 //!   terminal entries (older than `retention_secs`, default 1h), then the

@@ -278,9 +278,12 @@ impl FilesystemBackend {
     /// Returns the file contents and metadata. Files exceeding
     /// `config.max_file_bytes` are rejected before loading into memory.
     ///
-    /// The file-size cap ensures the serialized response stays within the
-    /// framing layer's 16 MiB read limit (with serde overhead absorbed by
-    /// the 4 GiB write guard).
+    /// The file-size cap bounds daemon memory, not the wire: `Vec<u8>`
+    /// serializes as a JSON array-of-numbers (~4x expansion), so even a
+    /// capped file can serialize past the 16 MiB framing limit. The
+    /// transport-layer response-size guard (`framing::write_message_sized`)
+    /// is the backstop that converts such oversize responses into a clean
+    /// `RpcError::InternalError`.
     pub async fn read_file(&self, path: &str) -> Result<(Vec<u8>, FileMetadata), FsError> {
         let canonical = self.resolve(path)?;
 
@@ -293,10 +296,11 @@ impl FilesystemBackend {
         // Reject files that exceed the configured size limit to prevent
         // memory exhaustion from oversized reads.
         //
-        // This cap also implicitly bounds the serialized RPC response: the
-        // file content plus serde overhead (headers, metadata) will stay
-        // well under the framing layer's 4 GiB write-side guard, so no
-        // additional check is needed in write_message.
+        // NOTE (FIX 11): this cap bounds memory, not the wire. `Vec<u8>`
+        // serializes as a JSON array-of-numbers (~4x expansion), so a
+        // capped file can still serialize past the 16 MiB framing limit.
+        // The transport-layer guard (`framing::write_message_sized`)
+        // converts such oversize responses into a clean RPC error.
         let size = meta.len();
         let limit = self.config.max_file_bytes as u64;
         if size > limit {
