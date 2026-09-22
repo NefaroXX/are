@@ -404,6 +404,14 @@ Re-copy the regenerated `server.pem` / `server.key` into `<container-ip>`'s
 `--server-name <hostname-or-IP>` to the client. The CA and client certs do
 not need regeneration.
 
+### Recorded result: Gate 4 on `192.168.0.13` (Debian 12 LXC)
+
+See [remote-test-results.md](remote-test-results.md) for the full evidence log:
+8/8 required filesystem scenarios plus `connect`/`doctor`, nested
+env-relative reads, and wrong `env-id` rejection — all verified against a real
+container with deliberate escape attacks (traversal, absolute, symlink, nested
+symlink all fail closed, exit 1, no root-path leak).
+
 ---
 
 ## Gate 3 Smoke Tests
