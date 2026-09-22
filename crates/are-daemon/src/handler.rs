@@ -1182,6 +1182,29 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_write_missing_parent_is_not_found() {
+        // Write under an absent parent chain (`missing-dir/` does not
+        // exist): the path does NOT escape — its parent simply does not
+        // exist. The backend's new `FsError::NotFound` must map through
+        // `fs_error_to_rpc` to `RpcError::NotFound` (it already does;
+        // this is the end-to-end guard) — never the misleading
+        // "filesystem escape blocked" InternalError.
+        let (_tmp, state) = fs_state();
+        let resp = state.handle(RpcRequest::WriteFile(are_core::WriteFileRequest {
+            environment_id: EnvironmentId::new("test-env"),
+            path: "missing-dir/file.txt".into(),
+            content: b"x".to_vec(),
+            overwrite: true,
+            expected_hash: None,
+        }));
+        assert!(
+            matches!(resp.result, Err(RpcError::NotFound(_))),
+            "missing parent must be RpcError::NotFound, got {:?}",
+            resp.result
+        );
+    }
+
     // ---- FIX 2: non-NotFound canonicalize failures stay generic at the
     //       RPC boundary — no host paths may reach the client ----
 

@@ -970,12 +970,21 @@ async fn main() {
                     std::process::exit(1);
                 }
 
-                if let Some(h) = &expect_hash {
-                    if !are_core::is_valid_hash(h) {
-                        eprintln!("error: --expect-hash must be 64 hex chars");
-                        std::process::exit(1);
-                    }
-                }
+                // (Gate 7 live-test fix) `are fs metadata` prints hashes as
+                // `blake3:<64 lowercase hex>`, and `are fs write` prints the
+                // result the same way. Accept that form verbatim (plus raw
+                // and/or uppercase hex), normalize to lowercase 64-hex, and
+                // send the normalized form to the daemon.
+                let expect_hash = match &expect_hash {
+                    Some(h) => match normalize_expect_hash(h) {
+                        Some(normalized) => Some(normalized),
+                        None => {
+                            eprintln!("error: --expect-hash must be 64 hex chars");
+                            std::process::exit(1);
+                        }
+                    },
+                    None => None,
+                };
 
                 let client =
                     match SecureClient::from_pem_files(&cert, &key, &ca, &addr, &server_name) {
@@ -1362,5 +1371,79 @@ async fn main() {
             EnvAction::Add { name } => println!("env add: {name} (stub)"),
             EnvAction::Remove { name } => println!("env remove: {name} (stub)"),
         },
+    }
+}
+
+/// Normalize a `--expect-hash` value before sending it to the daemon.
+///
+/// `are fs metadata`/`are fs write` print hashes as `blake3:<64 lowercase
+/// hex>`; users copy that exact string back into `--expect-hash`. Strip the
+/// optional `blake3:` prefix (exact lowercase; raw hex is accepted as-is),
+/// lowercase the hex (the daemon emits and compares lowercase), then require
+/// the canonical 64-hex shape. Returns `None` for anything that is not a
+/// valid hash after normalization.
+fn normalize_expect_hash(input: &str) -> Option<String> {
+    let hex = input.strip_prefix("blake3:").unwrap_or(input);
+    let hex = hex.to_ascii_lowercase();
+    if are_core::is_valid_hash(&hex) {
+        Some(hex)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_expect_hash;
+
+    #[test]
+    fn normalize_expect_hash_accepts_raw_lowercase_hex() {
+        let hex = "a".repeat(64);
+        assert_eq!(normalize_expect_hash(&hex).as_deref(), Some(hex.as_str()));
+    }
+
+    #[test]
+    fn normalize_expect_hash_strips_blake3_prefix() {
+        let hex = "a".repeat(64);
+        let prefixed = format!("blake3:{hex}");
+        assert_eq!(
+            normalize_expect_hash(&prefixed).as_deref(),
+            Some(hex.as_str())
+        );
+    }
+
+    #[test]
+    fn normalize_expect_hash_lowercases_uppercase_hex() {
+        // Raw uppercase hex is accepted and normalized to lowercase.
+        let expected = "a".repeat(64);
+        assert_eq!(
+            normalize_expect_hash(&"A".repeat(64)).as_deref(),
+            Some(expected.as_str())
+        );
+        // Prefixed uppercase hex too.
+        let upper = "B".repeat(64);
+        let prefixed_upper = format!("blake3:{upper}");
+        assert_eq!(
+            normalize_expect_hash(&prefixed_upper).as_deref(),
+            Some(upper.to_ascii_lowercase().as_str())
+        );
+    }
+
+    #[test]
+    fn normalize_expect_hash_rejects_invalid_shapes() {
+        let bad = [
+            String::new(),                        // empty
+            "blake3:".to_string(),                // prefix, no hex
+            "blake3:xyz".to_string(),             // prefix + short hex
+            "a".repeat(63),                       // too short
+            "a".repeat(65),                       // too long
+            "g".repeat(64),                       // non-hex char
+            format!("blake3:{}", "g".repeat(64)), // prefix + non-hex
+            format!("BLAKE3:{}", "a".repeat(64)), // uppercase prefix not stripped
+            format!("blake3:{}", "a".repeat(65)), // prefix + too long
+        ];
+        for input in bad {
+            assert_eq!(normalize_expect_hash(&input), None, "input: {input:?}");
+        }
     }
 }

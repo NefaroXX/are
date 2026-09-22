@@ -214,6 +214,78 @@ fn check_path_shape(path: &str) -> Result<(), FsError> {
     Ok(())
 }
 
+/// Outcome of classifying a root-joined path whose DIRECT parent is also
+/// missing (a multi-level missing chain).
+enum MissingParent {
+    /// Every existing ancestor is under the root and the missing tail
+    /// cannot climb above it lexically: the parent simply does not exist.
+    NotFound,
+    /// An existing ancestor resolves outside the root, or the missing tail
+    /// would escape above the root. Fail closed: report an escape.
+    Escape,
+    /// Classification hit a non-NotFound OS error (permission, ENOTDIR...).
+    Error(std::io::Error),
+}
+
+/// Classify why `joined` (a `root.join(request)`) cannot be canonicalized
+/// when the DIRECT parent is also missing.
+///
+/// Sound rule (Gate 7 live-test fix): walk up from the leaf to the deepest
+/// EXISTING ancestor, canonicalizing each level — the first success is that
+/// ancestor. If it (or any existing ancestor) resolves outside `root`, that
+/// is a genuine escape. Otherwise inspect the missing tail lexically: if
+/// walking its components from the root would climb above the root (a `..`
+/// with nothing beneath it), that is an escape too (fail closed). Only a
+/// benign "the parent chain is simply absent" classifies as
+/// [`MissingParent::NotFound`]. The walk is bounded: `root` itself is
+/// canonical by construction, so canonicalization eventually succeeds.
+fn classify_missing_parent(root: &std::path::Path, joined: &std::path::Path) -> MissingParent {
+    // Walk upward from the fullest path, popping the leaf of every missing
+    // ancestor, until canonicalization succeeds (the deepest existing
+    // ancestor) or fails for a non-NotFound reason.
+    let mut current = joined.to_path_buf();
+    let mut missing_tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match std::fs::canonicalize(&current) {
+            Ok(canonical) => {
+                if !canonical.starts_with(root) {
+                    return MissingParent::Escape;
+                }
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = current.file_name().map(std::ffi::OsStr::to_os_string) else {
+                    // Everything was popped and nothing canonicalized —
+                    // unreachable (the canonical root exists). Fail closed.
+                    return MissingParent::Escape;
+                };
+                missing_tail.push(name);
+                match current.parent() {
+                    Some(parent) => current = parent.to_path_buf(),
+                    None => return MissingParent::Escape,
+                }
+            }
+            Err(e) => return MissingParent::Error(e),
+        }
+    }
+
+    // `missing_tail` was pushed leaf→root; reversed it is the missing tail
+    // in path order. Simulate walking it from the (existing) root: a `..`
+    // that would climb above the root escapes the boundary.
+    let mut depth: i64 = 0;
+    for comp in missing_tail.iter().rev() {
+        if comp.as_os_str() == ".." {
+            depth -= 1;
+            if depth < 0 {
+                return MissingParent::Escape;
+            }
+        } else if comp.as_os_str() != "." {
+            depth += 1;
+        }
+    }
+    MissingParent::NotFound
+}
+
 /// Filesystem backend with strict path security.
 ///
 /// All operations go through `resolve()` to ensure paths stay within the
@@ -242,12 +314,19 @@ impl FilesystemBackend {
     /// - Symlinks that escape the root are rejected.
     /// - If the target does not exist, the parent directory is canonicalized
     ///   and checked, preventing TOCTOU on the leaf component.
+    /// - A multi-level missing parent (the parent chain simply does not
+    ///   exist, without escaping) yields `NotFound` — not an escape. A
+    ///   missing chain whose existing ancestor, or whose missing tail, would
+    ///   leave the root still yields `FilesystemEscape` (fail closed).
     pub fn resolve(&self, path: &str) -> Result<PathBuf, FsError> {
         // 1-2. Shape checks (empty / absolute / drive letter / NUL).
         check_path_shape(path)?;
 
         // 3. Try to resolve against each allowed root.
         let candidate = PathBuf::from(path);
+        // Set when a root's parent chain is benignly absent: a truthful
+        // NotFound, never an escape (see the classified `continue` below).
+        let mut parent_missing_under_root = false;
 
         for root in &self.config.allowed_roots {
             let joined = root.join(&candidate);
@@ -301,8 +380,43 @@ impl FilesystemBackend {
                                 ));
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                // Parent doesn't exist either — try next root or fail.
-                                continue;
+                                // Multi-level missing parent. Distinguish a
+                                // plain "parent does not exist" (NotFound)
+                                // from a GENUINE escape: an existing
+                                // ancestor leaving the root, or a missing
+                                // tail that would climb above it lexically.
+                                // Fail closed — anything ambiguous stays an
+                                // escape.
+                                match classify_missing_parent(root, &joined) {
+                                    MissingParent::NotFound => {
+                                        parent_missing_under_root = true;
+                                        continue;
+                                    }
+                                    MissingParent::Escape => {
+                                        tracing::debug!(
+                                            requested = %path,
+                                            "missing-parent chain escapes root"
+                                        );
+                                        return Err(FsError::FilesystemEscape(
+                                            "path escapes allowed boundary".into(),
+                                        ));
+                                    }
+                                    MissingParent::Error(e) => {
+                                        // Non-NotFound walk-up failure
+                                        // (permission, ENOTDIR...). Generic
+                                        // remote-facing message — the
+                                        // requested path and OS detail are
+                                        // log-only.
+                                        tracing::debug!(
+                                            requested = %path,
+                                            error = %e,
+                                            "cannot classify missing parent under any allowed root"
+                                        );
+                                        return Err(FsError::Io(
+                                            "failed to resolve parent directory".into(),
+                                        ));
+                                    }
+                                }
                             }
                             // Non-NotFound canonicalize failure (permission,
                             // ENOTDIR, ...). The remote-facing error must
@@ -340,6 +454,14 @@ impl FilesystemBackend {
             }
         }
 
+        // Loop reached only via a benign classified `continue`: every root's
+        // parent chain is absent without escaping. Report the truth — the
+        // path does NOT escape; its parent chain simply does not exist.
+        if parent_missing_under_root {
+            return Err(FsError::NotFound(format!(
+                "{path}: parent directory does not exist"
+            )));
+        }
         // Generic remote-facing message (no client path echo, no canonical
         // paths); the failing path is server-side log detail only.
         tracing::debug!(path = %path, "path does not resolve under any allowed root");
@@ -1764,14 +1886,72 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, FsError::FilesystemEscape(_)), "got: {err:?}");
-        // Missing parent dir: no implicit mkdir.
+        // Missing parent dir: no implicit mkdir. The failing parent chain
+        // does NOT escape — it is simply absent — so the error must be
+        // NotFound, never the misleading "escapes allowed boundary".
         let err = backend
             .write_file("no/such/dir/f.txt", b"x", true, None)
             .await
             .unwrap_err();
         assert!(
-            matches!(err, FsError::NotFound(_) | FsError::FilesystemEscape(_)),
-            "missing parent must fail closed, got: {err:?}"
+            matches!(err, FsError::NotFound(_)),
+            "missing parent must be NotFound, got: {err:?}"
+        );
+        // Nothing was written anywhere.
+        assert!(matches!(
+            backend.read_file("no/such/dir/f.txt").await,
+            Err(FsError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_missing_parent_is_not_found_not_escape() {
+        let (_tmp, backend) = make_backend();
+        // `notes/agent-notes.txt` with `notes/` absent: the parent chain
+        // does not exist and does not escape — NotFound, not Escape.
+        let err = backend.resolve("notes/agent-notes.txt").unwrap_err();
+        match &err {
+            FsError::NotFound(msg) => {
+                assert!(
+                    msg.contains("parent directory does not exist"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected NotFound, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_missing_tail_with_parent_dotdot_still_fails_closed() {
+        let (_tmp, backend) = make_backend();
+        // `missing/../../x` cannot resolve without leaving the root: the
+        // tail's `..` climbs ABOVE the root. Must fail closed as Escape on
+        // every platform (Windows lexically normalizes `missing/../..` away
+        // BEFORE the filesystem sees it, resolving to root's parent → the
+        // canonical-escape branch; Unix reaches the missing-tail classifier,
+        // which returns Escape for the same reason). Note `missing/../x` is
+        // deliberately NOT asserted: Windows canonicalize lexically folds it
+        // to `root/x` (a pre-existing, safe Ok), while Unix conservatively
+        // Escapes — both fail closed.
+        let err = backend.resolve("missing/../../x").unwrap_err();
+        assert!(
+            matches!(err, FsError::FilesystemEscape(_)),
+            "tail climbing above root must be Escape, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_missing_parent_is_not_found_not_escape() {
+        // Symmetric shape check for `resolve_no_follow` (delete/rename):
+        // a missing parent chain already yields NotFound there.
+        let (_tmp, backend) = make_backend();
+        let err = backend
+            .delete_path("missing-dir/file.txt")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FsError::NotFound(_)),
+            "no-follow missing parent must be NotFound, got: {err:?}"
         );
     }
 
