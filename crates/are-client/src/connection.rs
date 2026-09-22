@@ -271,6 +271,65 @@ impl SecureClient {
         }
     }
 
+    /// Write (create or replace) a file in the remote environment.
+    ///
+    /// Environment-scoped (no session): files belong to the environment.
+    pub async fn write_file(
+        &self,
+        req: are_core::WriteFileRequest,
+    ) -> Result<are_core::WriteFileResponse, ConnectionError> {
+        let response = self.send_rpc(RpcRequest::WriteFile(req)).await?;
+
+        match response.result {
+            Ok(RpcResponsePayload::WriteFile(resp)) => Ok(resp),
+            Err(e) => Err(ConnectionError::RpcError(e.to_string())),
+            _ => Err(ConnectionError::UnexpectedResponse),
+        }
+    }
+
+    /// Create a directory (and missing ancestors) in the remote environment.
+    pub async fn create_directory(
+        &self,
+        req: are_core::CreateDirectoryRequest,
+    ) -> Result<are_core::CreateDirectoryResponse, ConnectionError> {
+        let response = self.send_rpc(RpcRequest::CreateDirectory(req)).await?;
+
+        match response.result {
+            Ok(RpcResponsePayload::CreateDirectory(resp)) => Ok(resp),
+            Err(e) => Err(ConnectionError::RpcError(e.to_string())),
+            _ => Err(ConnectionError::UnexpectedResponse),
+        }
+    }
+
+    /// Rename (move) a file or directory in the remote environment.
+    pub async fn rename(
+        &self,
+        req: are_core::RenameRequest,
+    ) -> Result<are_core::RenameResponse, ConnectionError> {
+        let response = self.send_rpc(RpcRequest::Rename(req)).await?;
+
+        match response.result {
+            Ok(RpcResponsePayload::Rename(resp)) => Ok(resp),
+            Err(e) => Err(ConnectionError::RpcError(e.to_string())),
+            _ => Err(ConnectionError::UnexpectedResponse),
+        }
+    }
+
+    /// Delete a file or empty directory in the remote environment.
+    /// Never recursive: non-empty directories are refused server-side.
+    pub async fn delete_file(
+        &self,
+        req: are_core::DeleteRequest,
+    ) -> Result<are_core::DeleteResponse, ConnectionError> {
+        let response = self.send_rpc(RpcRequest::DeleteFile(req)).await?;
+
+        match response.result {
+            Ok(RpcResponsePayload::DeleteFile(resp)) => Ok(resp),
+            Err(e) => Err(ConnectionError::RpcError(e.to_string())),
+            _ => Err(ConnectionError::UnexpectedResponse),
+        }
+    }
+
     /// Send an RPC request and return the response.
     async fn send_rpc(&self, request: RpcRequest) -> Result<RpcResponse, ConnectionError> {
         // Establish TCP connection.

@@ -4,14 +4,17 @@
 //! knowledge of SSH, TCP, TLS, or HTTP. Implementations map these to
 //! whatever wire format the transport uses.
 //!
-//! # Public API surface (Gate 6)
+//! # Public API surface (Gate 7)
 //!
-//! `ReadFile`, `ListDirectory`, `GetFileMetadata`, `Execute`,
-//! `ProcessStatus`, `TerminateProcess`, `WaitProcess`, `CreateSession`,
-//! `GetSession`, `ListSessions`, and `TerminateSession` are part of the
-//! stable public API. `WriteFile` remains gated behind
-//! `#[cfg(any(test, feature = "future"))]` and is not re-exported from the
-//! crate root. It belongs to Gate 7.
+//! `ReadFile`, `WriteFile`, `CreateDirectory`, `Rename`, `Delete`,
+//! `ListDirectory`, `GetFileMetadata`, `Execute`, `ProcessStatus`,
+//! `TerminateProcess`, `WaitProcess`, `CreateSession`, `GetSession`,
+//! `ListSessions`, and `TerminateSession` are part of the stable public API.
+//!
+//! File operations are ENVIRONMENT-scoped, not session-scoped: files belong
+//! to the environment's allowed roots, while sessions only carry working
+//! directories and process state. Gate 8 may add per-session attribution;
+//! until then file RPCs take no `session_id`.
 //!
 //! Processes are keyed by `(environment_id, session_id, process_id)` in
 //! daemon memory. Every process operation requires a live session: the
@@ -47,6 +50,13 @@ pub fn now_secs() -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Metadata about a file or directory.
+///
+/// The `hash` field carries a content hash (BLAKE3-256, 64 lowercase hex
+/// chars) for regular files in SINGLE-FILE operations only (`read_file`,
+/// `write_file`, `get_file_metadata`, rename destination metadata).
+/// It is `None` for directories, and ALWAYS `None` for `list_directory`
+/// entries: hashing every listing entry would cost O(total bytes) per
+/// listing, turning a cheap readdir into a full-tree read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileMetadata {
     /// Size in bytes.
@@ -58,6 +68,25 @@ pub struct FileMetadata {
     pub is_dir: bool,
     /// Whether this entry is a regular file.
     pub is_file: bool,
+    /// Content hash (BLAKE3-256 hex) for regular files in single-file
+    /// ops; `None` for directories and for `list_directory` entries
+    /// (cost rationale above). Absent in pre-Gate-7 JSON: defaults to
+    /// `None` via `#[serde(default)]` for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+}
+
+/// Length of a valid content hash in hex chars (BLAKE3-256 = 32 bytes).
+pub const HASH_HEX_LEN: usize = 64;
+
+/// Check that a string is a valid content-hash shape: exactly 64 ASCII hex
+/// chars (case-insensitive on read; the daemon always emits lowercase).
+///
+/// `are-core` keeps no crypto dependency: the hash is an opaque `String`
+/// here. Only the SHAPE is validated at this layer; the daemon computes
+/// and compares actual digests.
+pub fn is_valid_hash(s: &str) -> bool {
+    s.len() == HASH_HEX_LEN && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// A single entry returned by directory listing.
@@ -122,14 +151,20 @@ pub struct ReadFileResponse {
 }
 
 // ---------------------------------------------------------------------------
-// WriteFile (Future gate — not part of stable API)
+// WriteFile (Gate 7 — stable API)
 // ---------------------------------------------------------------------------
 
 /// Request to write a file to the environment.
 ///
-/// **Not part of the public API.** Gated behind `feature = "future"`.
-/// Will become stable in Gate 7.
-#[cfg(any(test, feature = "future"))]
+/// Writes are atomic (temp file + fsync + same-directory rename) and
+/// environment-scoped (no `session_id`; see the module docs).
+///
+/// Optimistic concurrency via `expected_hash`:
+/// - `None` = blind write, honoring `overwrite` only.
+/// - `Some(h)` = proceed only if the file exists AND its current on-disk
+///   content hashes to `h`; otherwise the daemon refuses with a conflict
+///   error. A missing file with `Some(h)` is also a conflict (there is no
+///   content to match).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteFileRequest {
     pub environment_id: EnvironmentId,
@@ -137,12 +172,55 @@ pub struct WriteFileRequest {
     /// Must not escape the environment boundary.
     pub path: String,
     pub content: Vec<u8>,
-    /// If `false`, fail when the file already exists.
+    /// If `false` and the file already exists, the daemon refuses with a
+    /// conflict error (`RpcError::Conflict`).
     pub overwrite: bool,
+    /// Optional expected content hash (64 hex chars) for optimistic
+    /// concurrency. Absent in pre-Gate-7 JSON: defaults to `None`.
+    #[serde(default)]
+    pub expected_hash: Option<String>,
 }
 
-#[cfg(any(test, feature = "future"))]
 impl WriteFileRequest {
+    pub fn validate(&self) -> Result<(), crate::CoreError> {
+        if self.path.is_empty() {
+            return Err(crate::CoreError::InvalidRequest(
+                "path must not be empty".into(),
+            ));
+        }
+        if let Some(h) = &self.expected_hash {
+            if !is_valid_hash(h) {
+                return Err(crate::CoreError::InvalidRequest(format!(
+                    "expected_hash must be {HASH_HEX_LEN} hex chars, got {h:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Response from writing a file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteFileResponse {
+    /// Metadata of the written file, WITH a fresh content hash.
+    pub metadata: FileMetadata,
+}
+
+// ---------------------------------------------------------------------------
+// CreateDirectory (Gate 7 — stable API)
+// ---------------------------------------------------------------------------
+
+/// Request to create a directory (including missing ancestors, `mkdir -p`
+/// semantics). Idempotent: an existing directory succeeds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateDirectoryRequest {
+    pub environment_id: EnvironmentId,
+    /// Environment-relative path, resolved against allowed roots.
+    /// Must not escape the environment boundary.
+    pub path: String,
+}
+
+impl CreateDirectoryRequest {
     pub fn validate(&self) -> Result<(), crate::CoreError> {
         if self.path.is_empty() {
             return Err(crate::CoreError::InvalidRequest(
@@ -153,13 +231,97 @@ impl WriteFileRequest {
     }
 }
 
-/// Response from writing a file.
-///
-/// **Not part of the public API.** Gated behind `feature = "future"`.
-#[cfg(any(test, feature = "future"))]
+/// Response from creating a directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WriteFileResponse {
+pub struct CreateDirectoryResponse {
+    /// Metadata of the created (or already-existing) directory.
+    /// `hash` is always `None` for directories.
     pub metadata: FileMetadata,
+}
+
+// ---------------------------------------------------------------------------
+// Rename (Gate 7 — stable API)
+// ---------------------------------------------------------------------------
+
+/// Request to rename (move) a file or directory within the environment.
+///
+/// Both paths are environment-scoped. The rename is atomic when source and
+/// destination live on the same filesystem (same allowed root in practice).
+/// Refusals: `src == dst` is an invalid request; an existing destination is
+/// a conflict (no silent overwrite — rename-then-write instead).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameRequest {
+    pub environment_id: EnvironmentId,
+    /// Environment-relative source path. Must exist.
+    pub src: String,
+    /// Environment-relative destination path. Must NOT exist.
+    pub dst: String,
+}
+
+impl RenameRequest {
+    pub fn validate(&self) -> Result<(), crate::CoreError> {
+        if self.src.is_empty() {
+            return Err(crate::CoreError::InvalidRequest(
+                "src must not be empty".into(),
+            ));
+        }
+        if self.dst.is_empty() {
+            return Err(crate::CoreError::InvalidRequest(
+                "dst must not be empty".into(),
+            ));
+        }
+        if self.src == self.dst {
+            return Err(crate::CoreError::InvalidRequest(
+                "src and dst must differ".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Response from renaming a file or directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameResponse {
+    /// Metadata of the destination after the rename (with content hash
+    /// when the destination is a regular file).
+    pub metadata: FileMetadata,
+}
+
+// ---------------------------------------------------------------------------
+// Delete (Gate 7 — stable API)
+// ---------------------------------------------------------------------------
+
+/// Request to delete a file or EMPTY directory.
+///
+/// Deliberately NO recursive delete: a non-empty directory is refused with
+/// a conflict error and left intact (agent-safety rule — bulk removal must
+/// be explicit file-by-file work, never a single flag).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteRequest {
+    pub environment_id: EnvironmentId,
+    /// Environment-relative path, resolved against allowed roots.
+    /// Must not escape the environment boundary.
+    pub path: String,
+}
+
+impl DeleteRequest {
+    pub fn validate(&self) -> Result<(), crate::CoreError> {
+        if self.path.is_empty() {
+            return Err(crate::CoreError::InvalidRequest(
+                "path must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Response from deleting a file or directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteResponse {
+    /// Whether the delete happened. Always `true` today (missing targets
+    /// error instead); the field reserves forward-compatible
+    /// already-absent reporting without changing the wire shape.
+    pub deleted: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +838,18 @@ mod tests {
             modified_at: None,
             is_dir: false,
             is_file: true,
+            hash: None,
+        }
+    }
+
+    fn file_meta_hashed() -> FileMetadata {
+        FileMetadata {
+            size: 5,
+            modified_at: None,
+            is_dir: false,
+            is_file: true,
+            // BLAKE3-256 of b"hello".
+            hash: Some("ea8f163db38682925e4491c5e58d4bbd9b6b14d0faab39e5287c535a2b824c9b".into()),
         }
     }
 
@@ -706,6 +880,15 @@ mod tests {
             path: "/tmp/test".into(),
             content: vec![1, 2, 3],
             overwrite: true,
+            expected_hash: None,
+        };
+        assert!(req.validate().is_ok());
+        let req = WriteFileRequest {
+            environment_id: eid(),
+            path: "a.txt".into(),
+            content: vec![],
+            overwrite: false,
+            expected_hash: Some("a".repeat(64)),
         };
         assert!(req.validate().is_ok());
     }
@@ -717,8 +900,116 @@ mod tests {
             path: String::new(),
             content: vec![],
             overwrite: false,
+            expected_hash: None,
         };
         assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn write_file_validate_rejects_bad_hash_shape() {
+        for bad in [
+            "xyz".to_string(), // too short, non-hex
+            "a".repeat(63),    // one short
+            "a".repeat(65),    // one long
+            "g".repeat(64),    // non-hex char
+            " ".repeat(64),    // blanks
+            String::new(),     // empty string is not a hash
+        ] {
+            let req = WriteFileRequest {
+                environment_id: eid(),
+                path: "a.txt".into(),
+                content: vec![],
+                overwrite: true,
+                expected_hash: Some(bad.clone()),
+            };
+            assert!(
+                req.validate().is_err(),
+                "hash shape {bad:?} must be rejected"
+            );
+        }
+        // Uppercase hex passes the shape check (case-insensitive read).
+        let req = WriteFileRequest {
+            environment_id: eid(),
+            path: "a.txt".into(),
+            content: vec![],
+            overwrite: true,
+            expected_hash: Some("A".repeat(64)),
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn is_valid_hash_accepts_64_hex() {
+        assert!(is_valid_hash(&"a".repeat(64)));
+        assert!(is_valid_hash(&"A".repeat(64)));
+        assert!(is_valid_hash(
+            "ea8f163db38682925e4491c5e58d4bbd9b6b14d0faab39e5287c535a2b824c9b"
+        ));
+        assert!(!is_valid_hash(""));
+        assert!(!is_valid_hash(&"a".repeat(63)));
+        assert!(!is_valid_hash(&"a".repeat(65)));
+        assert!(!is_valid_hash(&"g".repeat(64)));
+        assert!(!is_valid_hash(
+            " not hex at all, way too long ................................"
+        ));
+    }
+
+    #[test]
+    fn mkdir_rename_delete_validate() {
+        assert!(CreateDirectoryRequest {
+            environment_id: eid(),
+            path: "a/b".into(),
+        }
+        .validate()
+        .is_ok());
+        assert!(CreateDirectoryRequest {
+            environment_id: eid(),
+            path: String::new(),
+        }
+        .validate()
+        .is_err());
+        assert!(RenameRequest {
+            environment_id: eid(),
+            src: "a".into(),
+            dst: "b".into(),
+        }
+        .validate()
+        .is_ok());
+        // Empty src / empty dst rejected.
+        assert!(RenameRequest {
+            environment_id: eid(),
+            src: String::new(),
+            dst: "b".into(),
+        }
+        .validate()
+        .is_err());
+        assert!(RenameRequest {
+            environment_id: eid(),
+            src: "a".into(),
+            dst: String::new(),
+        }
+        .validate()
+        .is_err());
+        // src == dst rejected (no-op renames are caller bugs).
+        assert!(RenameRequest {
+            environment_id: eid(),
+            src: "a".into(),
+            dst: "a".into(),
+        }
+        .validate()
+        .is_err());
+        assert!(DeleteRequest {
+            environment_id: eid(),
+            path: "a".into(),
+        }
+        .validate()
+        .is_ok());
+        assert!(DeleteRequest {
+            environment_id: eid(),
+            path: String::new(),
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -946,16 +1237,106 @@ mod tests {
             path: "/tmp/out".into(),
             content: vec![10, 20],
             overwrite: true,
+            expected_hash: Some("b".repeat(64)),
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: WriteFileRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
 
+        // Pre-Gate-7 JSON without `expected_hash` parses with None.
+        let legacy = serde_json::json!({
+            "environment_id": "test-env",
+            "path": "/tmp/out",
+            "content": [10, 20],
+            "overwrite": true,
+        });
+        let back: WriteFileRequest = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.expected_hash, None);
+
         let resp = WriteFileResponse {
-            metadata: file_meta(),
+            metadata: file_meta_hashed(),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: WriteFileResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, back);
+
+        // Pre-Gate-7 metadata JSON without `hash` parses with None.
+        let legacy_meta = serde_json::json!({
+            "size": 100,
+            "is_dir": false,
+            "is_file": true,
+        });
+        let back: FileMetadata = serde_json::from_value(legacy_meta).unwrap();
+        assert_eq!(back.hash, None);
+    }
+
+    #[test]
+    fn file_metadata_hash_roundtrip_and_listing_none() {
+        // Single-file metadata carries a hash; listing entries carry None
+        // (documented cost policy) — both serialize.
+        let hashed = file_meta_hashed();
+        let json = serde_json::to_string(&hashed).unwrap();
+        assert!(json.contains("hash"));
+        let back: FileMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(hashed, back);
+
+        let entry = DirectoryEntry {
+            name: "a.txt".into(),
+            path: "a.txt".into(),
+            metadata: file_meta(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: DirectoryEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.metadata.hash, None);
+    }
+
+    #[test]
+    fn mkdir_rename_delete_roundtrip() {
+        let req = CreateDirectoryRequest {
+            environment_id: eid(),
+            path: "a/b/c".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: CreateDirectoryRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+        let resp = CreateDirectoryResponse {
+            metadata: FileMetadata {
+                size: 0,
+                modified_at: None,
+                is_dir: true,
+                is_file: false,
+                hash: None,
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: CreateDirectoryResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, back);
+
+        let req = RenameRequest {
+            environment_id: eid(),
+            src: "a".into(),
+            dst: "b".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: RenameRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+        let resp = RenameResponse {
+            metadata: file_meta_hashed(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: RenameResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, back);
+
+        let req = DeleteRequest {
+            environment_id: eid(),
+            path: "a".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: DeleteRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+        let resp = DeleteResponse { deleted: true };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: DeleteResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(resp, back);
     }
 
@@ -978,6 +1359,7 @@ mod tests {
                     modified_at: None,
                     is_dir: true,
                     is_file: false,
+                    hash: None,
                 },
             }],
         };

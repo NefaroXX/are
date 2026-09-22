@@ -199,6 +199,150 @@ enum FsAction {
         /// Environment-relative path to inspect
         path: String,
     },
+
+    /// Write (create or replace) a file in the remote environment.
+    /// Content comes from exactly one of --content, --from-file, or stdin.
+    Write {
+        /// Server address (host:port)
+        #[arg(long, default_value = "127.0.0.1:9000")]
+        addr: String,
+
+        /// Path to client certificate PEM
+        #[arg(long)]
+        cert: PathBuf,
+
+        /// Path to client private key PEM
+        #[arg(long)]
+        key: PathBuf,
+
+        /// Path to CA certificate PEM
+        #[arg(long)]
+        ca: PathBuf,
+
+        /// Server hostname for SNI
+        #[arg(long, default_value = "localhost")]
+        server_name: String,
+
+        /// Environment ID
+        #[arg(long, default_value = "default")]
+        env_id: String,
+
+        /// Environment-relative destination path
+        path: String,
+
+        /// Inline content (mutually exclusive with --from-file; stdin
+        /// when neither is given)
+        #[arg(long, conflicts_with = "from_file")]
+        content: Option<String>,
+
+        /// Read content from a LOCAL file (explicit operator action: the
+        /// CLI never reads local files implicitly — only this flag opts
+        /// in to a local read for upload)
+        #[arg(long, conflicts_with = "content")]
+        from_file: Option<PathBuf>,
+
+        /// Expected current content hash for optimistic concurrency
+        /// (fails when the remote file changed since you read it)
+        #[arg(long)]
+        expect_hash: Option<String>,
+
+        /// Refuse to overwrite an existing file
+        #[arg(long)]
+        no_overwrite: bool,
+    },
+
+    /// Create a directory (and missing ancestors) remotely
+    Mkdir {
+        /// Server address (host:port)
+        #[arg(long, default_value = "127.0.0.1:9000")]
+        addr: String,
+
+        /// Path to client certificate PEM
+        #[arg(long)]
+        cert: PathBuf,
+
+        /// Path to client private key PEM
+        #[arg(long)]
+        key: PathBuf,
+
+        /// Path to CA certificate PEM
+        #[arg(long)]
+        ca: PathBuf,
+
+        /// Server hostname for SNI
+        #[arg(long, default_value = "localhost")]
+        server_name: String,
+
+        /// Environment ID
+        #[arg(long, default_value = "default")]
+        env_id: String,
+
+        /// Environment-relative path to create
+        path: String,
+    },
+
+    /// Rename (move) a remote file or directory
+    Mv {
+        /// Server address (host:port)
+        #[arg(long, default_value = "127.0.0.1:9000")]
+        addr: String,
+
+        /// Path to client certificate PEM
+        #[arg(long)]
+        cert: PathBuf,
+
+        /// Path to client private key PEM
+        #[arg(long)]
+        key: PathBuf,
+
+        /// Path to CA certificate PEM
+        #[arg(long)]
+        ca: PathBuf,
+
+        /// Server hostname for SNI
+        #[arg(long, default_value = "localhost")]
+        server_name: String,
+
+        /// Environment ID
+        #[arg(long, default_value = "default")]
+        env_id: String,
+
+        /// Environment-relative source path
+        src: String,
+
+        /// Environment-relative destination path (must not exist)
+        dst: String,
+    },
+
+    /// Delete a remote file or EMPTY directory (never recursive)
+    Rm {
+        /// Server address (host:port)
+        #[arg(long, default_value = "127.0.0.1:9000")]
+        addr: String,
+
+        /// Path to client certificate PEM
+        #[arg(long)]
+        cert: PathBuf,
+
+        /// Path to client private key PEM
+        #[arg(long)]
+        key: PathBuf,
+
+        /// Path to CA certificate PEM
+        #[arg(long)]
+        ca: PathBuf,
+
+        /// Server hostname for SNI
+        #[arg(long, default_value = "localhost")]
+        server_name: String,
+
+        /// Environment ID
+        #[arg(long, default_value = "default")]
+        env_id: String,
+
+        /// Environment-relative path to delete
+        path: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -450,6 +594,27 @@ fn make_sess_client(conn: &SessConn) -> SecureClient {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: failed to configure TLS: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Maximum bytes the CLI will read from stdin / --content / --from-file
+/// for `fs write`. Matches the daemon's 16 MiB file cap so oversized
+/// payloads fail locally with a clean error instead of a framing failure.
+const MAX_CLI_CONTENT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read stdin fully, capped at [`MAX_CLI_CONTENT_BYTES`] + 1 byte (the
+/// extra byte detects overflow so we can reject with a clean error
+/// instead of silently truncating).
+fn read_stdin_capped() -> Vec<u8> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    let limit = MAX_CLI_CONTENT_BYTES + 1;
+    match std::io::stdin().take(limit).read_to_end(&mut buf) {
+        Ok(_) => buf,
+        Err(e) => {
+            eprintln!("error: failed to read stdin: {e}");
             std::process::exit(1);
         }
     }
@@ -720,7 +885,249 @@ async fn main() {
                         if let Some(modified) = resp.metadata.modified_at {
                             println!("Modified: {modified:?}");
                         }
+                        if let Some(hash) = resp.metadata.hash {
+                            println!("Hash:     blake3:{hash}");
+                        }
                     }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            FsAction::Write {
+                addr,
+                cert,
+                key,
+                ca,
+                server_name,
+                env_id,
+                path,
+                content,
+                from_file,
+                expect_hash,
+                no_overwrite,
+            } => {
+                let env_id = match EnvironmentId::try_new(&env_id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        eprintln!("error: invalid environment_id: {e}");
+                        std::process::exit(1);
+                    }
+                };
+
+                // Exactly one content source: --content, --from-file, stdin.
+                let bytes: Vec<u8> = match (content, from_file) {
+                    (Some(text), None) => text.into_bytes(),
+                    (None, Some(local)) => {
+                        // Pre-stat BEFORE reading: an oversized --from-file
+                        // must fail without loading it into memory (symmetric
+                        // with the stdin `.take()` cap). A stat failure exits
+                        // with a clean error too.
+                        let size = match std::fs::metadata(&local) {
+                            Ok(meta) => meta.len(),
+                            Err(e) => {
+                                eprintln!(
+                                    "error: failed to stat --from-file {}: {e}",
+                                    local.display()
+                                );
+                                std::process::exit(1);
+                            }
+                        };
+                        if size > MAX_CLI_CONTENT_BYTES {
+                            eprintln!(
+                                "error: --from-file {} is {size} bytes, exceeds {}-byte cap",
+                                local.display(),
+                                MAX_CLI_CONTENT_BYTES
+                            );
+                            std::process::exit(1);
+                        }
+                        match std::fs::read(&local) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                eprintln!(
+                                    "error: failed to read --from-file {}: {e}",
+                                    local.display()
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    (None, None) => read_stdin_capped(),
+                    // Unreachable: clap `conflicts_with` rejects both.
+                    (Some(_), Some(_)) => {
+                        eprintln!("error: --content and --from-file are mutually exclusive");
+                        std::process::exit(1);
+                    }
+                };
+                if bytes.len() as u64 > MAX_CLI_CONTENT_BYTES {
+                    eprintln!(
+                        "error: content is {} bytes, exceeds {}-byte cap",
+                        bytes.len(),
+                        MAX_CLI_CONTENT_BYTES
+                    );
+                    std::process::exit(1);
+                }
+
+                if let Some(h) = &expect_hash {
+                    if !are_core::is_valid_hash(h) {
+                        eprintln!("error: --expect-hash must be 64 hex chars");
+                        std::process::exit(1);
+                    }
+                }
+
+                let client =
+                    match SecureClient::from_pem_files(&cert, &key, &ca, &addr, &server_name) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("error: failed to configure TLS: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                let req = are_core::WriteFileRequest {
+                    environment_id: env_id,
+                    path,
+                    content: bytes,
+                    overwrite: !no_overwrite,
+                    expected_hash: expect_hash,
+                };
+
+                match client.write_file(req).await {
+                    Ok(resp) => {
+                        println!("Wrote {} bytes", resp.metadata.size);
+                        if let Some(hash) = resp.metadata.hash {
+                            println!("Hash: blake3:{hash}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            FsAction::Mkdir {
+                addr,
+                cert,
+                key,
+                ca,
+                server_name,
+                env_id,
+                path,
+            } => {
+                let env_id = match EnvironmentId::try_new(&env_id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        eprintln!("error: invalid environment_id: {e}");
+                        std::process::exit(1);
+                    }
+                };
+
+                let client =
+                    match SecureClient::from_pem_files(&cert, &key, &ca, &addr, &server_name) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("error: failed to configure TLS: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                let req = are_core::CreateDirectoryRequest {
+                    environment_id: env_id,
+                    path,
+                };
+
+                match client.create_directory(req).await {
+                    Ok(_) => println!("Created directory"),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            FsAction::Mv {
+                addr,
+                cert,
+                key,
+                ca,
+                server_name,
+                env_id,
+                src,
+                dst,
+            } => {
+                let env_id = match EnvironmentId::try_new(&env_id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        eprintln!("error: invalid environment_id: {e}");
+                        std::process::exit(1);
+                    }
+                };
+
+                let client =
+                    match SecureClient::from_pem_files(&cert, &key, &ca, &addr, &server_name) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("error: failed to configure TLS: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                let req = are_core::RenameRequest {
+                    environment_id: env_id,
+                    src,
+                    dst,
+                };
+
+                match client.rename(req).await {
+                    Ok(resp) => {
+                        println!("Renamed ({} bytes)", resp.metadata.size);
+                        if let Some(hash) = resp.metadata.hash {
+                            println!("Hash: blake3:{hash}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            FsAction::Rm {
+                addr,
+                cert,
+                key,
+                ca,
+                server_name,
+                env_id,
+                path,
+            } => {
+                let env_id = match EnvironmentId::try_new(&env_id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        eprintln!("error: invalid environment_id: {e}");
+                        std::process::exit(1);
+                    }
+                };
+
+                let client =
+                    match SecureClient::from_pem_files(&cert, &key, &ca, &addr, &server_name) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("error: failed to configure TLS: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                let req = are_core::DeleteRequest {
+                    environment_id: env_id,
+                    path,
+                };
+
+                match client.delete_file(req).await {
+                    Ok(_) => println!("Deleted"),
                     Err(e) => {
                         eprintln!("error: {e}");
                         std::process::exit(1);

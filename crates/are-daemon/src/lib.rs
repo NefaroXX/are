@@ -113,12 +113,11 @@ pub fn build_daemon_state(config: &DaemonConfig) -> crate::handler::DaemonState 
     let platform = detect_platform(&operating_system);
 
     let mut advertised_capabilities = CapabilitySet::default();
-    // Gate 5: advertise only capabilities with enforceable handlers.
-    // read_file → FilesystemRead, list_directory → FilesystemList,
-    // file_metadata is an attribute read and maps to FilesystemRead.
-    // execute → ProcessExecute, process_status → ProcessInspect,
-    // terminate_process/wait_process → ProcessTerminate.
-    // FilesystemWrite stays OUT (Gate 7).
+    // Gate 7: advertise only capabilities with enforceable handlers.
+    // read_file/file_metadata → FilesystemRead, list_directory →
+    // FilesystemList, write_file/create_directory/rename/delete_file →
+    // FilesystemWrite. execute → ProcessExecute, process_status →
+    // ProcessInspect, terminate_process/wait_process → ProcessTerminate.
     // Capabilities are derived from the backends actually constructed
     // below: no fs backend → no Filesystem* caps; no proc manager → no
     // Process* caps. Advertising a handler that is not wired would lie to
@@ -137,6 +136,7 @@ pub fn build_daemon_state(config: &DaemonConfig) -> crate::handler::DaemonState 
     if fs.is_some() {
         advertised_capabilities.insert(are_core::Capability::FilesystemRead);
         advertised_capabilities.insert(are_core::Capability::FilesystemList);
+        advertised_capabilities.insert(are_core::Capability::FilesystemWrite);
     }
     // The process manager is always wired below, so Process* capabilities
     // are always advertised. If that ever becomes conditional, gate these
@@ -299,13 +299,16 @@ mod tests {
             ..Default::default()
         };
         let state = build_daemon_state(&config);
-        // Gate 5: only capabilities with enforceable handlers are advertised.
+        // Gate 7: only capabilities with enforceable handlers are advertised.
         assert!(state
             .advertised_capabilities
             .contains(&are_core::Capability::FilesystemRead));
         assert!(state
             .advertised_capabilities
             .contains(&are_core::Capability::FilesystemList));
+        assert!(state
+            .advertised_capabilities
+            .contains(&are_core::Capability::FilesystemWrite));
         assert!(state
             .advertised_capabilities
             .contains(&are_core::Capability::ProcessExecute));
@@ -315,11 +318,7 @@ mod tests {
         assert!(state
             .advertised_capabilities
             .contains(&are_core::Capability::ProcessTerminate));
-        // FilesystemWrite is NOT advertised (Gate 7).
-        assert!(!state
-            .advertised_capabilities
-            .contains(&are_core::Capability::FilesystemWrite));
-        assert_eq!(state.advertised_capabilities.len(), 5);
+        assert_eq!(state.advertised_capabilities.len(), 6);
     }
 
     #[test]

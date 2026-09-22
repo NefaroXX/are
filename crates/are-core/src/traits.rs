@@ -22,12 +22,18 @@ use async_trait::async_trait;
 /// remote, and future container implementations. No implementation may
 /// silently fall back to local execution.
 ///
-/// Only `write_file` remains gated behind `feature = "future"` (Gate 7).
-/// Process operations (`execute`, `process_status`, `terminate_process`,
-/// `wait_process`) are session-bound as of Gate 6: every process request
-/// carries a `session_id`, and session operations (`create_session`,
-/// `get_session`, `list_sessions`, `terminate_session`) manage the
-/// sessions processes belong to.
+/// As of Gate 7 every method on this trait is part of the stable API —
+/// nothing is gated behind a feature flag. Process operations (`execute`,
+/// `process_status`, `terminate_process`, `wait_process`) are session-bound
+/// as of Gate 6: every process request carries a `session_id`, and session
+/// operations (`create_session`, `get_session`, `list_sessions`,
+/// `terminate_session`) manage the sessions processes belong to.
+///
+/// File operations (`read_file`, `write_file`, `list_directory`,
+/// `file_metadata`, `create_directory`, `rename`, `delete_file`) are
+/// ENVIRONMENT-scoped, not session-scoped: they take no `session_id`
+/// (Gate 7 decision — files belong to the environment; Gate 8 may add
+/// per-session attribution).
 #[async_trait]
 #[allow(dead_code)]
 pub trait Environment: Send + Sync {
@@ -55,9 +61,21 @@ pub trait Environment: Send + Sync {
     /// Read the contents of a file.
     async fn read_file(&self, req: ReadFileRequest) -> Result<ReadFileResponse, CoreError>;
 
-    /// Write content to a file.
-    #[cfg(any(test, feature = "future"))]
+    /// Write content to a file (atomic temp-file + rename; optimistic
+    /// concurrency via `expected_hash`).
     async fn write_file(&self, req: WriteFileRequest) -> Result<WriteFileResponse, CoreError>;
+
+    /// Create a directory, including missing ancestors. Idempotent.
+    async fn create_directory(
+        &self,
+        req: CreateDirectoryRequest,
+    ) -> Result<CreateDirectoryResponse, CoreError>;
+
+    /// Rename (move) a file or directory. Refuses existing destinations.
+    async fn rename(&self, req: RenameRequest) -> Result<RenameResponse, CoreError>;
+
+    /// Delete a file or empty directory. Never recursive.
+    async fn delete_file(&self, req: DeleteRequest) -> Result<DeleteResponse, CoreError>;
 
     /// List the entries in a directory.
     async fn list_directory(
@@ -164,11 +182,11 @@ mod tests {
                     modified_at: None,
                     is_dir: false,
                     is_file: true,
+                    hash: None,
                 },
             })
         }
 
-        #[cfg(any(test, feature = "future"))]
         async fn write_file(&self, _req: WriteFileRequest) -> Result<WriteFileResponse, CoreError> {
             Ok(WriteFileResponse {
                 metadata: FileMetadata {
@@ -176,8 +194,40 @@ mod tests {
                     modified_at: None,
                     is_dir: false,
                     is_file: true,
+                    hash: None,
                 },
             })
+        }
+
+        async fn create_directory(
+            &self,
+            _req: CreateDirectoryRequest,
+        ) -> Result<CreateDirectoryResponse, CoreError> {
+            Ok(CreateDirectoryResponse {
+                metadata: FileMetadata {
+                    size: 0,
+                    modified_at: None,
+                    is_dir: true,
+                    is_file: false,
+                    hash: None,
+                },
+            })
+        }
+
+        async fn rename(&self, _req: RenameRequest) -> Result<RenameResponse, CoreError> {
+            Ok(RenameResponse {
+                metadata: FileMetadata {
+                    size: 0,
+                    modified_at: None,
+                    is_dir: false,
+                    is_file: true,
+                    hash: None,
+                },
+            })
+        }
+
+        async fn delete_file(&self, _req: DeleteRequest) -> Result<DeleteResponse, CoreError> {
+            Ok(DeleteResponse { deleted: true })
         }
         async fn list_directory(
             &self,
@@ -196,6 +246,7 @@ mod tests {
                     modified_at: None,
                     is_dir: false,
                     is_file: true,
+                    hash: None,
                 },
             })
         }

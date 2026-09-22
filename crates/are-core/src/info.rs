@@ -11,13 +11,15 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CapabilitySet, CoreError, CreateSessionRequest, CreateSessionResponse, EnvironmentId,
+    CapabilitySet, CoreError, CreateDirectoryRequest, CreateDirectoryResponse,
+    CreateSessionRequest, CreateSessionResponse, DeleteRequest, DeleteResponse, EnvironmentId,
     ExecuteRequest, ExecuteResponse, GetFileMetadataRequest, GetFileMetadataResponse,
     GetSessionRequest, GetSessionResponse, ListDirectoryRequest, ListDirectoryResponse,
     ListSessionsRequest, ListSessionsResponse, Platform, ProcessStatusRequest,
-    ProcessStatusResponse, ReadFileRequest, ReadFileResponse, TerminateProcessRequest,
-    TerminateProcessResponse, TerminateSessionRequest, TerminateSessionResponse,
-    WaitProcessRequest, WaitProcessResponse,
+    ProcessStatusResponse, ReadFileRequest, ReadFileResponse, RenameRequest, RenameResponse,
+    TerminateProcessRequest, TerminateProcessResponse, TerminateSessionRequest,
+    TerminateSessionResponse, WaitProcessRequest, WaitProcessResponse, WriteFileRequest,
+    WriteFileResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -89,6 +91,19 @@ pub enum RpcRequest {
     /// Read a file from the environment.
     #[serde(rename = "read_file")]
     ReadFile(ReadFileRequest),
+    /// Write (create or replace) a file in the environment (Gate 7:
+    /// atomic write with optimistic concurrency).
+    #[serde(rename = "write_file")]
+    WriteFile(WriteFileRequest),
+    /// Create a directory, including missing ancestors (Gate 7).
+    #[serde(rename = "create_directory")]
+    CreateDirectory(CreateDirectoryRequest),
+    /// Rename (move) a file or directory within the environment (Gate 7).
+    #[serde(rename = "rename")]
+    Rename(RenameRequest),
+    /// Delete a file or empty directory (Gate 7; never recursive).
+    #[serde(rename = "delete_file")]
+    DeleteFile(DeleteRequest),
     /// List directory contents.
     #[serde(rename = "list_directory")]
     ListDirectory(ListDirectoryRequest),
@@ -138,6 +153,18 @@ pub enum RpcResponsePayload {
     /// File read response.
     #[serde(rename = "read_file")]
     ReadFile(ReadFileResponse),
+    /// File write response (Gate 7).
+    #[serde(rename = "write_file")]
+    WriteFile(WriteFileResponse),
+    /// Directory creation response (Gate 7).
+    #[serde(rename = "create_directory")]
+    CreateDirectory(CreateDirectoryResponse),
+    /// Rename response (Gate 7).
+    #[serde(rename = "rename")]
+    Rename(RenameResponse),
+    /// Delete response (Gate 7).
+    #[serde(rename = "delete_file")]
+    DeleteFile(DeleteResponse),
     /// Directory listing response.
     #[serde(rename = "list_directory")]
     ListDirectory(ListDirectoryResponse),
@@ -222,6 +249,16 @@ pub enum RpcError {
     /// "retry after reaping/expiry" from daemon failures.
     #[error("capacity exceeded: {0}")]
     CapacityExceeded(String),
+
+    /// Optimistic-concurrency / state-conflict refusal (Gate 7): stale
+    /// `expected_hash` on write, `overwrite: false` with an existing file,
+    /// rename onto an existing destination, or delete of a non-empty
+    /// directory. Distinct from `InvalidRequest` (malformed) and `NotFound`
+    /// (missing): the request was well-formed but the current filesystem
+    /// state forbids it. Retrying the identical request will fail the same
+    /// way — re-read first.
+    #[error("conflict: {0}")]
+    Conflict(String),
 
     /// An internal daemon error occurred.
     #[error("internal error: {0}")]
@@ -326,6 +363,7 @@ mod tests {
             RpcError::SessionNotFound("sess-9".into()),
             RpcError::SessionExpired("sess-8".into()),
             RpcError::CapacityExceeded("table full".into()),
+            RpcError::Conflict("content changed".into()),
         ] {
             let json = serde_json::to_string(&err).unwrap();
             let back: RpcError = serde_json::from_str(&json).unwrap();
@@ -380,6 +418,82 @@ mod tests {
     }
 
     #[test]
+    fn rpc_request_write_ops_roundtrip() {
+        let write = RpcRequest::WriteFile(WriteFileRequest {
+            environment_id: EnvironmentId::new("dev"),
+            path: "a.txt".into(),
+            content: vec![1, 2],
+            overwrite: true,
+            expected_hash: None,
+        });
+        let json = serde_json::to_string(&write).unwrap();
+        assert!(json.contains("\"write_file\""));
+        let back: RpcRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(json, serde_json::to_string(&back).unwrap());
+
+        let mkdir = RpcRequest::CreateDirectory(CreateDirectoryRequest {
+            environment_id: EnvironmentId::new("dev"),
+            path: "a/b".into(),
+        });
+        let json = serde_json::to_string(&mkdir).unwrap();
+        assert!(json.contains("\"create_directory\""));
+        let back: RpcRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(json, serde_json::to_string(&back).unwrap());
+
+        let mv = RpcRequest::Rename(RenameRequest {
+            environment_id: EnvironmentId::new("dev"),
+            src: "a".into(),
+            dst: "b".into(),
+        });
+        let json = serde_json::to_string(&mv).unwrap();
+        assert!(json.contains("\"rename\""));
+        let back: RpcRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(json, serde_json::to_string(&back).unwrap());
+
+        let rm = RpcRequest::DeleteFile(DeleteRequest {
+            environment_id: EnvironmentId::new("dev"),
+            path: "a".into(),
+        });
+        let json = serde_json::to_string(&rm).unwrap();
+        assert!(json.contains("\"delete_file\""));
+        let back: RpcRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(json, serde_json::to_string(&back).unwrap());
+    }
+
+    #[test]
+    fn rpc_response_write_ops_roundtrip() {
+        let meta = || crate::request::FileMetadata {
+            size: 2,
+            modified_at: None,
+            is_dir: false,
+            is_file: true,
+            hash: Some("c".repeat(64)),
+        };
+        let cases = [
+            RpcResponsePayload::WriteFile(WriteFileResponse { metadata: meta() }),
+            RpcResponsePayload::CreateDirectory(CreateDirectoryResponse {
+                metadata: crate::request::FileMetadata {
+                    size: 0,
+                    modified_at: None,
+                    is_dir: true,
+                    is_file: false,
+                    hash: None,
+                },
+            }),
+            RpcResponsePayload::Rename(RenameResponse { metadata: meta() }),
+            RpcResponsePayload::DeleteFile(DeleteResponse { deleted: true }),
+        ];
+        for payload in cases {
+            let resp = RpcResponse {
+                result: Ok(payload),
+            };
+            let json = serde_json::to_string(&resp).unwrap();
+            let back: RpcResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(json, serde_json::to_string(&back).unwrap());
+        }
+    }
+
+    #[test]
     fn rpc_request_execute_roundtrip() {
         let req = RpcRequest::Execute(ExecuteRequest {
             environment_id: EnvironmentId::new("dev"),
@@ -393,6 +507,21 @@ mod tests {
         let back: RpcRequest = serde_json::from_str(&json).unwrap();
         let json2 = serde_json::to_string(&back).unwrap();
         assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn rpc_error_conflict_roundtrip() {
+        let err = RpcError::Conflict("destination exists".into());
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("onflict"));
+        let back: RpcError = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, RpcError::Conflict(_)));
+        assert_eq!(format!("{err}"), format!("{back}"));
+        // Conflict survives inside an RpcResponse envelope.
+        let resp = RpcResponse { result: Err(err) };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: RpcResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(json, serde_json::to_string(&back).unwrap());
     }
 
     #[test]
@@ -475,6 +604,7 @@ mod tests {
                     modified_at: None,
                     is_dir: false,
                     is_file: true,
+                    hash: None,
                 },
             })),
         };
@@ -507,6 +637,7 @@ mod tests {
                         modified_at: None,
                         is_dir: false,
                         is_file: true,
+                        hash: None,
                     },
                 },
             )),

@@ -6,6 +6,9 @@
 //! `ProcessStatus`, `TerminateProcess`, and `WaitProcess`. Gate 6 adds
 //! `CreateSession`, `GetSession` (resume), `ListSessions`, and
 //! `TerminateSession`, and binds every process operation to a live session.
+//! Gate 7 adds `WriteFile`, `CreateDirectory`, `Rename`, and `DeleteFile`:
+//! environment-scoped (no session), atomic writes, optimistic concurrency,
+//! no recursive delete.
 //!
 //! Session checks run BEFORE process-table lookups on every session-scoped
 //! operation: an unknown session yields `SessionNotFound`, an expired one
@@ -154,6 +157,30 @@ impl DaemonState {
                 let result = self.handle_get_file_metadata(req);
                 RpcResponse {
                     result: result.map(RpcResponsePayload::GetFileMetadata),
+                }
+            }
+            RpcRequest::WriteFile(req) => {
+                let result = self.handle_write_file(req);
+                RpcResponse {
+                    result: result.map(RpcResponsePayload::WriteFile),
+                }
+            }
+            RpcRequest::CreateDirectory(req) => {
+                let result = self.handle_create_directory(req);
+                RpcResponse {
+                    result: result.map(RpcResponsePayload::CreateDirectory),
+                }
+            }
+            RpcRequest::Rename(req) => {
+                let result = self.handle_rename(req);
+                RpcResponse {
+                    result: result.map(RpcResponsePayload::Rename),
+                }
+            }
+            RpcRequest::DeleteFile(req) => {
+                let result = self.handle_delete_file(req);
+                RpcResponse {
+                    result: result.map(RpcResponsePayload::DeleteFile),
                 }
             }
             RpcRequest::Execute(req) => {
@@ -306,6 +333,106 @@ impl DaemonState {
         .map_err(|e| fs_error_to_rpc(e, &req.path))?;
 
         Ok(are_core::GetFileMetadataResponse { metadata })
+    }
+
+    /// Require the filesystem backend and check the environment binding
+    /// first, mirroring the read-path handlers. File operations are
+    /// ENVIRONMENT-scoped, not session-scoped (Gate 7 decision): files
+    /// belong to the environment's allowed roots; sessions only carry
+    /// working directories and process state. No `session_id` is taken.
+    fn require_fs(
+        &self,
+        environment_id: &are_core::EnvironmentId,
+    ) -> Result<&FilesystemBackend, RpcError> {
+        if *environment_id != self.environment_id {
+            return Err(RpcError::InvalidRequest(format!(
+                "requested environment '{environment_id}' does not match daemon environment '{}'",
+                self.environment_id
+            )));
+        }
+        self.fs
+            .as_ref()
+            .ok_or_else(|| RpcError::InternalError("filesystem backend not configured".into()))
+    }
+
+    fn handle_write_file(
+        &self,
+        req: are_core::WriteFileRequest,
+    ) -> Result<are_core::WriteFileResponse, RpcError> {
+        // Domain validation first (empty path, malformed expected_hash).
+        if let Err(e) = req.validate() {
+            return Err(RpcError::InvalidRequest(e.to_string()));
+        }
+        let fs = self.require_fs(&req.environment_id)?;
+        let req_clone = req.clone();
+        let metadata = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                fs.write_file(
+                    &req_clone.path,
+                    &req_clone.content,
+                    req_clone.overwrite,
+                    req_clone.expected_hash.as_deref(),
+                )
+                .await
+            })
+        })
+        .map_err(|e| fs_error_to_rpc(e, &req.path))?;
+
+        Ok(are_core::WriteFileResponse { metadata })
+    }
+
+    fn handle_create_directory(
+        &self,
+        req: are_core::CreateDirectoryRequest,
+    ) -> Result<are_core::CreateDirectoryResponse, RpcError> {
+        if let Err(e) = req.validate() {
+            return Err(RpcError::InvalidRequest(e.to_string()));
+        }
+        let fs = self.require_fs(&req.environment_id)?;
+        let req_clone = req.clone();
+        let metadata = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { fs.create_directory(&req_clone.path).await })
+        })
+        .map_err(|e| fs_error_to_rpc(e, &req.path))?;
+
+        Ok(are_core::CreateDirectoryResponse { metadata })
+    }
+
+    fn handle_rename(
+        &self,
+        req: are_core::RenameRequest,
+    ) -> Result<are_core::RenameResponse, RpcError> {
+        if let Err(e) = req.validate() {
+            return Err(RpcError::InvalidRequest(e.to_string()));
+        }
+        let fs = self.require_fs(&req.environment_id)?;
+        let req_clone = req.clone();
+        let metadata = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { fs.rename_path(&req_clone.src, &req_clone.dst).await })
+        })
+        .map_err(|e| fs_error_to_rpc(e, &format!("{} -> {}", req.src, req.dst)))?;
+
+        Ok(are_core::RenameResponse { metadata })
+    }
+
+    fn handle_delete_file(
+        &self,
+        req: are_core::DeleteRequest,
+    ) -> Result<are_core::DeleteResponse, RpcError> {
+        if let Err(e) = req.validate() {
+            return Err(RpcError::InvalidRequest(e.to_string()));
+        }
+        let fs = self.require_fs(&req.environment_id)?;
+        let req_clone = req.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { fs.delete_path(&req_clone.path).await })
+        })
+        .map_err(|e| fs_error_to_rpc(e, &req.path))?;
+
+        Ok(are_core::DeleteResponse { deleted: true })
     }
 
     /// Require the process backend and check the environment binding first,
@@ -605,13 +732,16 @@ fn fs_error_to_rpc(err: FsError, path: &str) -> RpcError {
         FsError::FilesystemEscape(msg) => {
             RpcError::InternalError(format!("filesystem escape blocked: {msg}"))
         }
-        FsError::NotFound(_) => RpcError::InternalError(format!("{path}: not found")),
+        FsError::NotFound(_) => RpcError::NotFound(format!("{path}: not found")),
+        FsError::Conflict(msg) => RpcError::Conflict(format!("{path}: {msg}")),
         FsError::PermissionDenied(_) => {
             RpcError::InternalError(format!("{path}: permission denied"))
         }
         FsError::NotADirectory(_) => RpcError::InternalError(format!("{path}: not a directory")),
         FsError::IsADirectory(_) => RpcError::InternalError(format!("{path}: is a directory")),
-        FsError::FileTooLarge { path, size, limit } => RpcError::InternalError(format!(
+        // Oversized payloads/reads are REFUSED as InvalidRequest (the
+        // client could have bounded the request) — not an internal fault.
+        FsError::FileTooLarge { path, size, limit } => RpcError::InvalidRequest(format!(
             "file too large: {path} is {size} bytes, limit is {limit} bytes"
         )),
         FsError::Io(msg) => RpcError::InternalError(format!("{path}: I/O error: {msg}")),
@@ -793,6 +923,290 @@ mod tests {
                 assert!(msg.contains("does not match"));
             }
             other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    // ---- Gate 7: file-write dispatch (environment-scoped, no session) ----
+
+    /// Build a `DaemonState` wired with a filesystem backend rooted at a
+    /// temp dir. File ops take no session: this state has none.
+    fn fs_state() -> (tempfile::TempDir, DaemonState) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fs =
+            FilesystemBackend::new(FilesystemConfig::new(&[tmp.path().to_path_buf()]).unwrap());
+        let mut caps = CapabilitySet::default();
+        caps.insert(Capability::FilesystemRead);
+        caps.insert(Capability::FilesystemList);
+        caps.insert(Capability::FilesystemWrite);
+        let state = DaemonState::with_fs(
+            EnvironmentId::new("test-env"),
+            "test-host".into(),
+            "0.1.0".into(),
+            caps,
+            Platform::Debian,
+            fs,
+        );
+        (tmp, state)
+    }
+
+    #[test]
+    fn handle_write_ops_without_fs_backend() {
+        let state = test_state();
+        for req in [
+            RpcRequest::WriteFile(are_core::WriteFileRequest {
+                environment_id: EnvironmentId::new("test-env"),
+                path: "a.txt".into(),
+                content: b"x".to_vec(),
+                overwrite: true,
+                expected_hash: None,
+            }),
+            RpcRequest::CreateDirectory(are_core::CreateDirectoryRequest {
+                environment_id: EnvironmentId::new("test-env"),
+                path: "a".into(),
+            }),
+            RpcRequest::Rename(are_core::RenameRequest {
+                environment_id: EnvironmentId::new("test-env"),
+                src: "a".into(),
+                dst: "b".into(),
+            }),
+            RpcRequest::DeleteFile(are_core::DeleteRequest {
+                environment_id: EnvironmentId::new("test-env"),
+                path: "a".into(),
+            }),
+        ] {
+            let resp = state.handle(req);
+            match resp.result {
+                Err(RpcError::InternalError(msg)) => {
+                    assert!(msg.contains("filesystem backend not configured"), "{msg}");
+                }
+                other => panic!("expected InternalError, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn handle_write_ops_wrong_env_rejected_first() {
+        let (_tmp, state) = fs_state();
+        for req in [
+            RpcRequest::WriteFile(are_core::WriteFileRequest {
+                environment_id: EnvironmentId::new("wrong-env"),
+                path: "a.txt".into(),
+                content: b"x".to_vec(),
+                overwrite: true,
+                expected_hash: None,
+            }),
+            RpcRequest::CreateDirectory(are_core::CreateDirectoryRequest {
+                environment_id: EnvironmentId::new("wrong-env"),
+                path: "a".into(),
+            }),
+            RpcRequest::Rename(are_core::RenameRequest {
+                environment_id: EnvironmentId::new("wrong-env"),
+                src: "a".into(),
+                dst: "b".into(),
+            }),
+            RpcRequest::DeleteFile(are_core::DeleteRequest {
+                environment_id: EnvironmentId::new("wrong-env"),
+                path: "a".into(),
+            }),
+        ] {
+            let resp = state.handle(req);
+            match resp.result {
+                Err(RpcError::InvalidRequest(msg)) => assert!(msg.contains("does not match")),
+                other => panic!("expected InvalidRequest, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn handle_write_rejects_malformed_expected_hash() {
+        let (_tmp, state) = fs_state();
+        let req = RpcRequest::WriteFile(are_core::WriteFileRequest {
+            environment_id: EnvironmentId::new("test-env"),
+            path: "a.txt".into(),
+            content: b"x".to_vec(),
+            overwrite: true,
+            expected_hash: Some("not-a-hash".into()),
+        });
+        let resp = state.handle(req);
+        assert!(
+            matches!(resp.result, Err(RpcError::InvalidRequest(_))),
+            "malformed expected_hash must be InvalidRequest, got {:?}",
+            resp.result
+        );
+    }
+
+    #[test]
+    fn handle_rename_rejects_src_eq_dst() {
+        let (_tmp, state) = fs_state();
+        let req = RpcRequest::Rename(are_core::RenameRequest {
+            environment_id: EnvironmentId::new("test-env"),
+            src: "a".into(),
+            dst: "a".into(),
+        });
+        let resp = state.handle(req);
+        assert!(
+            matches!(resp.result, Err(RpcError::InvalidRequest(_))),
+            "src==dst must be InvalidRequest, got {:?}",
+            resp.result
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_write_mkdir_rename_delete_happy_path() {
+        let (_tmp, state) = fs_state();
+        let env = EnvironmentId::new("test-env");
+
+        // write
+        let resp = state.handle(RpcRequest::WriteFile(are_core::WriteFileRequest {
+            environment_id: env.clone(),
+            path: "hello.txt".into(),
+            content: b"hello".to_vec(),
+            overwrite: true,
+            expected_hash: None,
+        }));
+        let hash = match resp.result {
+            Ok(RpcResponsePayload::WriteFile(w)) => {
+                assert_eq!(w.metadata.size, 5);
+                match w.metadata.hash {
+                    Some(h) => h,
+                    None => panic!("write must return a hash"),
+                }
+            }
+            other => panic!("expected WriteFile response, got {other:?}"),
+        };
+
+        // stale-hash overwrite refuses with Conflict (RPC-level check).
+        let resp = state.handle(RpcRequest::WriteFile(are_core::WriteFileRequest {
+            environment_id: env.clone(),
+            path: "hello.txt".into(),
+            content: b"stale".to_vec(),
+            overwrite: true,
+            expected_hash: Some("d".repeat(64)),
+        }));
+        assert!(
+            matches!(resp.result, Err(RpcError::Conflict(_))),
+            "stale hash must be Conflict, got {:?}",
+            resp.result
+        );
+
+        // fresh-hash overwrite succeeds.
+        let resp = state.handle(RpcRequest::WriteFile(are_core::WriteFileRequest {
+            environment_id: env.clone(),
+            path: "hello.txt".into(),
+            content: b"hello2".to_vec(),
+            overwrite: true,
+            expected_hash: Some(hash),
+        }));
+        assert!(
+            matches!(resp.result, Ok(RpcResponsePayload::WriteFile(_))),
+            "fresh hash must succeed, got {:?}",
+            resp.result
+        );
+
+        // mkdir
+        let resp = state.handle(RpcRequest::CreateDirectory(
+            are_core::CreateDirectoryRequest {
+                environment_id: env.clone(),
+                path: "sub/dir".into(),
+            },
+        ));
+        assert!(
+            matches!(resp.result, Ok(RpcResponsePayload::CreateDirectory(_))),
+            "got {:?}",
+            resp.result
+        );
+
+        // rename
+        let resp = state.handle(RpcRequest::Rename(are_core::RenameRequest {
+            environment_id: env.clone(),
+            src: "hello.txt".into(),
+            dst: "sub/moved.txt".into(),
+        }));
+        assert!(
+            matches!(resp.result, Ok(RpcResponsePayload::Rename(_))),
+            "got {:?}",
+            resp.result
+        );
+
+        // rename onto existing dst conflicts.
+        let resp = state.handle(RpcRequest::Rename(are_core::RenameRequest {
+            environment_id: env.clone(),
+            src: "sub/moved.txt".into(),
+            dst: "sub/dir".into(),
+        }));
+        assert!(
+            matches!(resp.result, Err(RpcError::Conflict(_))),
+            "got {:?}",
+            resp.result
+        );
+
+        // delete non-empty dir conflicts.
+        let resp = state.handle(RpcRequest::DeleteFile(are_core::DeleteRequest {
+            environment_id: env.clone(),
+            path: "sub".into(),
+        }));
+        assert!(
+            matches!(resp.result, Err(RpcError::Conflict(_))),
+            "got {:?}",
+            resp.result
+        );
+
+        // delete file, then empty dirs, bottom-up.
+        for p in ["sub/moved.txt", "sub/dir", "sub"] {
+            let resp = state.handle(RpcRequest::DeleteFile(are_core::DeleteRequest {
+                environment_id: env.clone(),
+                path: p.into(),
+            }));
+            assert!(
+                matches!(resp.result, Ok(RpcResponsePayload::DeleteFile(_))),
+                "delete {p} must succeed, got {:?}",
+                resp.result
+            );
+        }
+    }
+
+    // ---- FIX 4: fs error categories map to distinct RPC errors ----
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_rename_missing_src_is_not_found() {
+        let (_tmp, state) = fs_state();
+        let resp = state.handle(RpcRequest::Rename(are_core::RenameRequest {
+            environment_id: EnvironmentId::new("test-env"),
+            src: "missing.txt".into(),
+            dst: "other.txt".into(),
+        }));
+        assert!(
+            matches!(resp.result, Err(RpcError::NotFound(_))),
+            "missing rename src must be NotFound, got {:?}",
+            resp.result
+        );
+    }
+
+    // ---- FIX 2: non-NotFound canonicalize failures stay generic at the
+    //       RPC boundary — no host paths may reach the client ----
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_delete_under_file_error_leaks_no_host_root() {
+        let (tmp, state) = fs_state();
+        // `file.txt/child/x`: parent `file.txt` is a FILE, so the parent
+        // canonicalize fails — ENOTDIR-as-Io on Linux (which previously
+        // leaked the allowed ROOT host path), NotFound on Windows. Either
+        // way the RPC error must NOT embed the root.
+        std::fs::write(tmp.path().join("file.txt"), "x").unwrap();
+        let root_str = tmp.path().to_string_lossy().to_string();
+        let resp = state.handle(RpcRequest::DeleteFile(are_core::DeleteRequest {
+            environment_id: EnvironmentId::new("test-env"),
+            path: "file.txt/child/x".into(),
+        }));
+        match resp.result {
+            Err(RpcError::InternalError(msg)) | Err(RpcError::NotFound(msg)) => {
+                assert!(!msg.contains(&root_str), "leaked allowed root: {msg}");
+                assert!(
+                    !msg.contains(tmp.path().file_name().unwrap().to_string_lossy().as_ref()),
+                    "leaked root component: {msg}"
+                );
+            }
+            other => panic!("expected InternalError or NotFound, got {other:?}"),
         }
     }
 

@@ -173,6 +173,7 @@ mod tests {
             modified_at: None,
             is_dir: false,
             is_file: true,
+            hash: None,
         }
     }
 
