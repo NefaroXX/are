@@ -29,7 +29,8 @@ pub struct Environment {
     /// Operations this environment advertises as available.
     ///
     /// This is NOT per-client authorization — all clients see the same set.
-    /// Per-client capability enforcement arrives in Gate 8.
+    /// Per-client enforcement is Gate 8 grants: effective = advertised ∩
+    /// grants (see `docs/grants.md`).
     pub advertised_capabilities: CapabilitySet,
     /// Additional metadata.
     pub metadata: EnvironmentMetadata,

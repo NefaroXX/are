@@ -121,15 +121,21 @@ If you omit `--cert`, `--key`, and `--ca` on the daemon, `ared` generates
   --cert certs/server.pem \
   --key certs/server.key \
   --ca certs/ca.pem \
-  --allowed-root /path/to/your/workspace
+  --allowed-root /path/to/your/workspace \
+  --permissive-authz
 ```
+
+> Gate 8+: the daemon refuses to start without an authorization mode —
+> pass `--grants-file grants.json` (strict, see `docs/grants.md`) or
+> `--permissive-authz` (dev only, any authenticated client may do anything).
 
 ### With ephemeral certs (single-process dev only)
 
 ```bash
 ./target/debug/ared listen \
   --port 9000 \
-  --allowed-root ./test-workspace
+  --allowed-root ./test-workspace \
+  --permissive-authz
 ```
 
 The daemon prints a warning that it is using ephemeral certs. It listens on

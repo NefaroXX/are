@@ -14,7 +14,9 @@ path = "src/main.rs"
 [dependencies]
 are-core.workspace = true
 are-client.workspace = true
+blake3.workspace = true
 clap.workspace = true
+rustls-pemfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

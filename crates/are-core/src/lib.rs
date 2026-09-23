@@ -19,6 +19,7 @@
 mod capability;
 mod environment;
 mod error;
+mod grant;
 mod identity;
 mod ids;
 mod info;
@@ -29,6 +30,10 @@ mod traits;
 pub use capability::{Capability, CapabilitySet};
 pub use environment::{Environment, EnvironmentMetadata};
 pub use error::CoreError;
+pub use grant::{
+    grants_allow_exec, grants_allow_fs, grants_allow_inspect, grants_allow_terminate,
+    normalize_grant_root, normalize_program_name, root_covers, FsGrantKind, Grant,
+};
 pub use identity::{
     EnrollmentCredential, MachineIdentity, RevocationReason, TrustAnchor, ENROLLMENT_MAX_TTL_SECS,
 };

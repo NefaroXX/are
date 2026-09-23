@@ -547,6 +547,75 @@ impl FilesystemBackend {
         ))
     }
 
+    /// Relativize an already-resolved canonical path against the allowed
+    /// roots, returning the env-relative path with `/` separators (`""`
+    /// for the root itself). Returns `None` when the path is under no
+    /// root — unreachable for `resolve`/`resolve_no_follow` output (both
+    /// guarantee containment); the handler treats `None` as a defensive
+    /// escape error.
+    ///
+    /// Gate 8 uses this AFTER resolution for authorization: the grant
+    /// check runs on the canonical location (symlinks already followed),
+    /// never on the client-supplied string.
+    pub fn relativize(&self, canonical: &std::path::Path) -> Option<String> {
+        for root in &self.config.allowed_roots {
+            let Ok(rel) = canonical.strip_prefix(root) else {
+                continue;
+            };
+            if rel.as_os_str().is_empty() {
+                return Some(String::new());
+            }
+            let mut parts = Vec::new();
+            for comp in rel.components() {
+                match comp {
+                    std::path::Component::Normal(c) => {
+                        parts.push(c.to_string_lossy().into_owned());
+                    }
+                    // Canonical paths contain no `.`/`..`/prefixes; anything
+                    // else is fail-closed (no grant evaluation on it).
+                    _ => return None,
+                }
+            }
+            return Some(parts.join("/"));
+        }
+        None
+    }
+
+    /// Lexical env-relative form of a creation path (`create_directory`),
+    /// for authorization.
+    ///
+    /// Mirrors `ensure_dir_under_root`'s component walk exactly (same
+    /// rejection set: `..`, absolute prefixes, empty names) and returns the
+    /// cleaned relative path the op will create — without touching the
+    /// filesystem. RESIDUAL (documented): a pre-existing symlink in an
+    /// ancestor prefix aliases the real location (the op follows it after
+    /// boundary-checking it). No symlink-creation op exists, so only
+    /// host-planted links can alias — outside the client threat model;
+    /// see `docs/grants.md`.
+    pub fn creation_rel(&self, path: &str) -> Result<String, FsError> {
+        check_path_shape(path)?;
+        let requested = PathBuf::from(path);
+        let mut parts = Vec::new();
+        for comp in requested.components() {
+            use std::path::Component::{CurDir, Normal, ParentDir, Prefix, RootDir};
+            match comp {
+                Normal(c) => parts.push(c.to_string_lossy().into_owned()),
+                CurDir => {}
+                ParentDir | RootDir | Prefix(_) => {
+                    return Err(FsError::InvalidPath(format!(
+                        "invalid component in directory path: {path}"
+                    )));
+                }
+            }
+        }
+        if parts.is_empty() {
+            return Err(FsError::InvalidPath(format!(
+                "no directory name in path: {path}"
+            )));
+        }
+        Ok(parts.join("/"))
+    }
+
     /// Ensure a directory (and all missing ancestors) exists under the
     /// primary allowed root, verifying each prefix.
     ///

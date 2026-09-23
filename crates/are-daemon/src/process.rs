@@ -27,8 +27,9 @@
 //!   opt-in `permissive` mode is set (development only). Matching is by
 //!   **normalized basename** (lowercase, `.exe` suffix stripped) — see
 //!   [`ProcessConfig::check_policy`]. KNOWN LIMITATION: basename matching
-//!   is bypassable by renamed copies and `PATH` shadowing; Gate 8 must do
-//!   canonical-path allowlisting (+hash pinning).
+//!   is bypassable by renamed copies and `PATH` shadowing; canonical-path
+//!   allowlisting (+hash pinning) remains future work (deferred past Gate
+//!   8 — grants match the same normalized basenames).
 //! - **Environment sanitization and merge.** Merge order is daemon
 //!   environment < session env < request env (request wins on conflicts).
 //!   Request- and session-supplied `PATH` are rejected outright (programs
@@ -255,7 +256,9 @@ impl ProcessConfig {
     /// lowercased, with a trailing `.exe` stripped — so `shutdown.exe`,
     /// `SHUTDOWN`, and `/sbin/shutdown` are all denied by the default deny
     /// list, and an allow entry of `git` also matches `git.exe`. Allow-list
-    /// entries are normalized the same way before comparison.
+    /// entries are normalized the same way before comparison. The single
+    /// canonical normalization is [`are_core::normalize_program_name`],
+    /// shared with Gate 8 grant matching so policy and grants cannot drift.
     ///
     /// The deny list is always enforced; the allow list applies when
     /// configured. With no allow list and `permissive == false` every
@@ -264,20 +267,24 @@ impl ProcessConfig {
     /// KNOWN LIMITATION (honest): basename-only matching is bypassable by
     /// renamed copies (`cp /sbin/shutdown /tmp/totally-fine`) and by `PATH`
     /// shadowing. This policy is a tripwire against accidents, not a
-    /// sandbox. Gate 8 must do canonical-path allowlisting (+hash pinning).
+    /// sandbox. Canonical-path allowlisting (+hash pinning) remains future
+    /// work (deferred past Gate 8).
     pub fn check_policy(&self, program: &str) -> Result<(), ProcessError> {
-        let base = normalized_basename(program);
+        let base = are_core::normalize_program_name(program);
         if self
             .denied_executables
             .iter()
-            .any(|d| normalize_exe_name(d) == base)
+            .any(|d| are_core::normalize_program_name(d) == base)
         {
             return Err(ProcessError::DeniedExecutable(format!(
                 "program {base:?} is denied by execution policy"
             )));
         }
         if let Some(allowed) = &self.allowed_executables {
-            if !allowed.iter().any(|a| normalize_exe_name(a) == base) {
+            if !allowed
+                .iter()
+                .any(|a| are_core::normalize_program_name(a) == base)
+            {
                 return Err(ProcessError::DeniedExecutable(format!(
                     "program {base:?} is not in the allowed executable list"
                 )));
@@ -303,24 +310,6 @@ impl ProcessConfig {
 /// `cargo` and `/usr/bin/cargo`.
 pub fn program_basename(program: &str) -> &str {
     program.rsplit(['/', '\\']).next().unwrap_or(program)
-}
-
-/// Normalize a basename for policy comparison: ASCII-lowercase with a
-/// single trailing `.exe` stripped.
-///
-/// Normalization exists so the deny list cannot be trivially bypassed by
-/// case or extension on Windows (`shutdown.exe`, `SHUTDOWN.EXE`). It is
-/// NOT a sandbox boundary — see the known-limitation note on
-/// [`ProcessConfig::check_policy`].
-fn normalize_exe_name(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
-    lower.strip_suffix(".exe").unwrap_or(&lower).to_string()
-}
-
-/// Basename + normalization in one step: the canonical form the policy
-/// compares.
-fn normalized_basename(program: &str) -> String {
-    normalize_exe_name(program_basename(program))
 }
 
 /// Returns `true` for terminal states (output complete, final).

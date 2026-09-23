@@ -15,8 +15,10 @@
 //! No filesystem, process, or session operations are implemented yet.
 //! Protocol selection is documented in `tls.rs` and `framing.rs`.
 
+pub mod auth;
 pub mod framing;
 pub mod fs;
+pub mod grants;
 pub mod handler;
 pub mod process;
 pub mod server;
@@ -65,6 +67,13 @@ pub struct DaemonConfig {
     /// allow list is configured. Development only: every spawn is logged
     /// at warn level. See `--permissive-exec`.
     pub permissive_exec: bool,
+    /// Capability grants table (Gate 8). `None` = NO grants file was
+    /// given: legacy-permissive mode (any authenticated client may do
+    /// anything the backends allow — development only, loud WARN at
+    /// startup). `Some` = STRICT: unknown fingerprints get
+    /// `GetEnvironmentInfo` only; known fingerprints get exactly their
+    /// grants. Ownership isolation applies in BOTH modes.
+    pub grants: Option<crate::grants::GrantsTable>,
 }
 
 impl Default for DaemonConfig {
@@ -82,6 +91,7 @@ impl Default for DaemonConfig {
             allowed_root: None,
             allowed_executables: None,
             permissive_exec: false,
+            grants: None,
         }
     }
 }
@@ -176,6 +186,24 @@ pub fn build_daemon_state(config: &DaemonConfig) -> crate::handler::DaemonState 
     );
     state.fs = fs.clone();
     state.proc = Some(proc_manager);
+    // Gate 8 authorization mode: grants file present → STRICT (unknown
+    // fingerprints get GetEnvironmentInfo only); absent →
+    // legacy-permissive (loud WARN — development only). Ownership
+    // isolation applies in both modes.
+    match &config.grants {
+        Some(table) => {
+            tracing::info!(
+                principals = table.len(),
+                "capability grants loaded: STRICT authorization mode"
+            );
+            state.grants = Some(table.clone());
+        }
+        None => {
+            let msg = "no --grants-file: legacy-permissive mode — ANY authenticated client may do ANYTHING (development only)";
+            tracing::warn!("{msg}");
+            eprintln!("WARNING: {msg}");
+        }
+    }
     // Sessions share the environment binding and filesystem resolver
     // (session working directories resolve against the same allowed roots).
     // The per-session process cap comes from the same `DaemonConfig`

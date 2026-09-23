@@ -25,10 +25,13 @@
 //!
 //! KNOWN LEAK (expiry oracle): `NotFound` (never existed / terminated) vs
 //! `Expired` (was once live) lets any client confirm an id was once live.
-//! Gate 8 must return generic `NotFound` to non-owners once
-//! [`SessionInfo`](are_core::SessionInfo)`.owner` is bound to the
-//! client-cert identity, and add a cross-client indistinguishability test.
-//! No behavior change today: owner binding does not exist yet.
+//! Gate 8 closes this for cross-principal access: the owner-aware methods
+//! below (`*_owned`) return generic `NotFound` to non-owners even when the
+//! entry expired (the entry is still removed, and the removed id is
+//! reported so the handler best-effort kills its processes). Owners — and
+//! legacy ownerless sessions — keep the precise `Expired` distinction.
+//! See `docs/grants.md` and the cross-client indistinguishability test in
+//! `tests/gate8_authz.rs`.
 //!
 //! NO EXPIRY PATH SILENTLY ORPHANS LIVE CHILDREN: every expiry removal is
 //! reported up to the handler (`get`/`touch` via `Expired`, `create`/`list`
@@ -120,9 +123,10 @@ pub enum SessionError {
 
     /// No session with this id is known (never existed or terminated).
     /// NOTE: distinct from [`SessionError::Expired`], which leaks that the
-    /// id was once live (expiry oracle). Gate 8 must return generic
-    /// `NotFound` to non-owners; add a cross-client indistinguishability
-    /// test then.
+    /// id was once live (expiry oracle). The owner-aware `*_owned` methods
+    /// collapse the distinction for non-owners (generic `NotFound` either
+    /// way); direct `get`/`touch` callers must be legacy/test paths or
+    /// same-owner paths.
     #[error("session not found: {0}")]
     NotFound(String),
 
@@ -155,6 +159,23 @@ fn is_expired(info: &SessionInfo, config: &SessionConfig, now: u64) -> bool {
     let idle = now.saturating_sub(info.last_activity);
     let age = now.saturating_sub(info.created_at);
     idle > config.idle_timeout_secs || age > config.max_lifetime_secs
+}
+
+/// Ownership check for owner-aware access.
+///
+/// - Stored `None` (legacy ownerless record) → wildcard: any caller may
+///   address it (debug-logged — these records predate identity binding).
+/// - Stored `Some(owner)` → only that fingerprint; `None` callers (legacy
+///   path) are denied like any other non-owner.
+fn owner_permits(stored: Option<&str>, caller_fp: Option<&str>) -> bool {
+    match (stored, caller_fp) {
+        (None, _) => {
+            tracing::debug!("ownerless session accessed: legacy wildcard applies");
+            true
+        }
+        (Some(_), None) => false,
+        (Some(owner), Some(fp)) => owner == fp,
+    }
 }
 
 /// Allocate an unpredictable session id: `sess-` + 32 lowercase hex chars
@@ -238,9 +259,24 @@ impl SessionManager {
     /// expiry sweep. The caller (handler) must best-effort kill each purged
     /// session's processes: purged sessions may still own live children,
     /// and without the kill they would become unaddressable orphans.
+    ///
+    /// The session is ownerless (`owner: None`): a legacy wildcard any
+    /// caller may address. Prefer [`SessionManager::create_owned`].
     pub fn create(
         &self,
         req: CreateSessionRequest,
+    ) -> Result<(SessionInfo, Vec<SessionId>), SessionError> {
+        self.create_owned(req, None)
+    }
+
+    /// Create a session bound to `owner` (`Some(fingerprint)` normally;
+    /// `None` for the legacy/test wildcard path, logged at debug level).
+    ///
+    /// Otherwise identical to [`SessionManager::create`].
+    pub fn create_owned(
+        &self,
+        req: CreateSessionRequest,
+        owner: Option<String>,
     ) -> Result<(SessionInfo, Vec<SessionId>), SessionError> {
         req.validate()
             .map_err(|e| SessionError::InvalidRequest(e.to_string()))?;
@@ -317,9 +353,10 @@ impl SessionManager {
             env_vars: sanitize_stored_env(&req.env_vars),
             created_at: now,
             last_activity: now,
-            // Gate 8 binds this to the client-cert identity. `None` today
-            // means legacy single-principal: no owner check.
-            owner: None,
+            // Gate 8: bound to the client-cert fingerprint by the handler.
+            // `None` is the legacy wildcard (no owner check) — used by
+            // direct manager callers and the legacy handler path.
+            owner,
         };
         table.insert(id, SessionRecord { info: info.clone() });
         tracing::info!(
@@ -390,24 +427,191 @@ impl SessionManager {
     /// then calls this (kill-then-remove). Expired entries are removed and
     /// reported as [`SessionError::Expired`], not `NotFound`.
     pub fn terminate(&self, session_id: &SessionId) -> Result<(), SessionError> {
+        self.terminate_owned(session_id, None).0
+    }
+
+    /// Owner-aware fetch (the resume operation for `caller_fp`).
+    ///
+    /// `caller_fp: None` = legacy wildcard path (today's behavior exactly).
+    /// Otherwise the access rule is:
+    ///
+    /// - missing id → `NotFound` (no `purged`);
+    /// - owner mismatch → `NotFound` — EVEN when the entry expired. The
+    ///   expired entry is still removed and reported in `purged` so the
+    ///   handler best-effort kills its processes (kill-on-expiry is never
+    ///   skipped, only the error category is collapsed: non-owners can
+    ///   never observe `Expired`);
+    /// - owner match (or legacy ownerless record — wildcard, debug-logged)
+    ///   → normal semantics: `Expired` (removed, in `purged`) or the live
+    ///   session (activity bumped).
+    ///
+    /// A mismatch NEVER bumps activity: bumping would let a prober keep
+    /// someone else's session alive (or perturb its expiry clock).
+    pub fn get_owned(
+        &self,
+        session_id: &SessionId,
+        caller_fp: Option<&str>,
+    ) -> (Result<SessionInfo, SessionError>, Vec<SessionId>) {
         let now = now_secs();
-        let mut table = self
-            .sessions
-            .lock()
-            .map_err(|_| SessionError::Internal("session table poisoned".into()))?;
-        let record = table
-            .get(session_id)
-            .ok_or_else(|| SessionError::NotFound(format!("unknown session id '{session_id}'")))?;
+        let mut table = match self.sessions.lock() {
+            Ok(table) => table,
+            Err(_) => {
+                return (
+                    Err(SessionError::Internal("session table poisoned".into())),
+                    Vec::new(),
+                );
+            }
+        };
+        let Some(record) = table.get_mut(session_id) else {
+            return (
+                Err(SessionError::NotFound(format!(
+                    "unknown session id '{session_id}'"
+                ))),
+                Vec::new(),
+            );
+        };
+        if !owner_permits(record.info.owner.as_deref(), caller_fp) {
+            // Cross-owner access: hide everything, including expiry. Still
+            // purge an expired entry (kill is the handler's job via
+            // `purged`) so hiding never orphans live children.
+            if is_expired(&record.info, &self.config, now) {
+                table.remove(session_id);
+                tracing::debug!(
+                    session_id = %session_id,
+                    "non-owner touched expired session; entry removed, reported as NotFound"
+                );
+                return (
+                    Err(SessionError::NotFound(format!(
+                        "unknown session id '{session_id}'"
+                    ))),
+                    vec![session_id.clone()],
+                );
+            }
+            return (
+                Err(SessionError::NotFound(format!(
+                    "unknown session id '{session_id}'"
+                ))),
+                Vec::new(),
+            );
+        }
+        if is_expired(&record.info, &self.config, now) {
+            table.remove(session_id);
+            tracing::debug!(session_id = %session_id, "session expired on access; entry removed");
+            return (
+                Err(SessionError::Expired(format!(
+                    "session '{session_id}' expired"
+                ))),
+                vec![session_id.clone()],
+            );
+        }
+        record.info.last_activity = now;
+        (Ok(record.info.clone()), Vec::new())
+    }
+
+    /// Alias for [`SessionManager::get_owned`] used by session-scoped
+    /// process operations: every execute/status/wait/terminate proves
+    /// liveness, so all of them bump activity. Listing does NOT touch
+    /// (read-only scan).
+    pub fn touch_owned(
+        &self,
+        session_id: &SessionId,
+        caller_fp: Option<&str>,
+    ) -> (Result<SessionInfo, SessionError>, Vec<SessionId>) {
+        self.get_owned(session_id, caller_fp)
+    }
+
+    /// Owner-aware list: live sessions for the environment visible to
+    /// `caller_fp` — owned sessions plus legacy ownerless ones (wildcard,
+    /// visible to all). `None` (legacy path) lists everything, as today.
+    ///
+    /// Expired entries are purged first and returned so the handler can
+    /// best-effort kill their processes. Listing bumps no activity.
+    pub fn list_owned(
+        &self,
+        environment_id: &EnvironmentId,
+        caller_fp: Option<&str>,
+    ) -> (Vec<SessionInfo>, Vec<SessionId>) {
+        let now = now_secs();
+        let mut table = match self.sessions.lock() {
+            Ok(table) => table,
+            Err(_) => return (Vec::new(), Vec::new()),
+        };
+        let purged = purge_expired_locked(&mut table, &self.config, now);
+        let live = table
+            .values()
+            .filter(|record| record.info.environment_id == *environment_id)
+            .filter(|record| match caller_fp {
+                None => true,
+                Some(fp) => record.info.owner.is_none() || record.info.owner.as_deref() == Some(fp),
+            })
+            .map(|record| record.info.clone())
+            .collect();
+        (live, purged)
+    }
+
+    /// Owner-aware remove (the handler kills session processes FIRST, then
+    /// calls this — kill-then-remove).
+    ///
+    /// Same visibility rule as [`SessionManager::get_owned`]: non-owners
+    /// see `NotFound` even for expired entries (still removed + reported
+    /// in `purged` for the kill); owners see `Expired` for expired entries.
+    pub fn terminate_owned(
+        &self,
+        session_id: &SessionId,
+        caller_fp: Option<&str>,
+    ) -> (Result<(), SessionError>, Vec<SessionId>) {
+        let now = now_secs();
+        let mut table = match self.sessions.lock() {
+            Ok(table) => table,
+            Err(_) => {
+                return (
+                    Err(SessionError::Internal("session table poisoned".into())),
+                    Vec::new(),
+                );
+            }
+        };
+        let Some(record) = table.get(session_id) else {
+            return (
+                Err(SessionError::NotFound(format!(
+                    "unknown session id '{session_id}'"
+                ))),
+                Vec::new(),
+            );
+        };
+        if !owner_permits(record.info.owner.as_deref(), caller_fp) {
+            if is_expired(&record.info, &self.config, now) {
+                table.remove(session_id);
+                tracing::debug!(
+                    session_id = %session_id,
+                    "non-owner terminated expired session; entry removed, reported as NotFound"
+                );
+                return (
+                    Err(SessionError::NotFound(format!(
+                        "unknown session id '{session_id}'"
+                    ))),
+                    vec![session_id.clone()],
+                );
+            }
+            return (
+                Err(SessionError::NotFound(format!(
+                    "unknown session id '{session_id}'"
+                ))),
+                Vec::new(),
+            );
+        }
         if is_expired(&record.info, &self.config, now) {
             table.remove(session_id);
             tracing::debug!(session_id = %session_id, "expired session terminated; entry removed");
-            return Err(SessionError::Expired(format!(
-                "session '{session_id}' expired"
-            )));
+            return (
+                Err(SessionError::Expired(format!(
+                    "session '{session_id}' expired"
+                ))),
+                vec![session_id.clone()],
+            );
         }
         table.remove(session_id);
         tracing::info!(session_id = %session_id, "session terminated");
-        Ok(())
+        (Ok(()), Vec::new())
     }
 }
 
@@ -679,5 +883,105 @@ mod tests {
             config.max_processes_per_session,
             DEFAULT_MAX_PROCESSES_PER_SESSION
         );
+    }
+
+    // ---- Gate 8: ownership isolation ----
+
+    const FP_A: &str = "blake3:owner-a";
+    const FP_B: &str = "blake3:owner-b";
+
+    fn create_owned(mgr: &SessionManager, owner: Option<&str>) -> are_core::SessionInfo {
+        mgr.create_owned(create_req(None, HashMap::new()), owner.map(str::to_string))
+            .expect("create_owned")
+            .0
+    }
+
+    #[test]
+    fn owned_create_binds_owner() {
+        let (_tmp, mgr) = test_manager(SessionConfig::default());
+        let info = create_owned(&mgr, Some(FP_A));
+        assert_eq!(info.owner.as_deref(), Some(FP_A));
+        let legacy = create_owned(&mgr, None);
+        assert_eq!(legacy.owner, None);
+    }
+
+    #[test]
+    fn owner_mismatch_is_not_found_no_activity_bump() {
+        let (_tmp, mgr) = test_manager(SessionConfig::default());
+        let info = create_owned(&mgr, Some(FP_A));
+        let before = info.last_activity;
+        // Non-owner sees NotFound (not "owned by someone else").
+        let (result, purged) = mgr.get_owned(&info.session_id, Some(FP_B));
+        assert!(matches!(result, Err(SessionError::NotFound(_))));
+        assert!(purged.is_empty(), "live entries are never purged");
+        // No activity bump: the owner's clock is untouched by the probe.
+        let (result, _) = mgr.get_owned(&info.session_id, Some(FP_A));
+        let resumed = result.unwrap();
+        assert_eq!(resumed.last_activity, before);
+        // Legacy wildcard path reaches ownerless records only.
+        let legacy = create_owned(&mgr, None);
+        assert!(mgr.get_owned(&legacy.session_id, None).0.is_ok());
+        assert!(mgr.get_owned(&legacy.session_id, Some(FP_B)).0.is_ok());
+        // ...but not owned ones.
+        assert!(matches!(
+            mgr.get_owned(&info.session_id, None).0,
+            Err(SessionError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn non_owner_never_sees_expired_but_entry_is_purged() {
+        let (_tmp, mgr) = test_manager(SessionConfig {
+            idle_timeout_secs: 1,
+            ..SessionConfig::default()
+        });
+        let info = create_owned(&mgr, Some(FP_A));
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        // Non-owner: generic NotFound, but the expired entry IS removed
+        // (reported for the handler's kill-on-expiry).
+        let (result, purged) = mgr.get_owned(&info.session_id, Some(FP_B));
+        assert!(matches!(result, Err(SessionError::NotFound(_))));
+        assert_eq!(purged, vec![info.session_id.clone()]);
+        // Owner, second entry: sees the precise Expired.
+        let info2 = create_owned(&mgr, Some(FP_A));
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let (result, purged) = mgr.touch_owned(&info2.session_id, Some(FP_A));
+        assert!(matches!(result, Err(SessionError::Expired(_))));
+        assert_eq!(purged, vec![info2.session_id.clone()]);
+    }
+
+    #[test]
+    fn list_owned_filters_by_owner() {
+        let (_tmp, mgr) = test_manager(SessionConfig::default());
+        let a = create_owned(&mgr, Some(FP_A));
+        let _b = create_owned(&mgr, Some(FP_B));
+        let legacy = create_owned(&mgr, None);
+        // A sees own + legacy wildcard, never B's.
+        let (live, _) = mgr.list_owned(&test_env(), Some(FP_A));
+        let ids: Vec<_> = live.iter().map(|s| &s.session_id).collect();
+        assert!(ids.contains(&&a.session_id));
+        assert!(ids.contains(&&legacy.session_id));
+        assert_eq!(live.len(), 2);
+        // Legacy path (None) lists everything, as before Gate 8.
+        let (live, _) = mgr.list_owned(&test_env(), None);
+        assert_eq!(live.len(), 3);
+    }
+
+    #[test]
+    fn terminate_owned_enforces_visibility() {
+        let (_tmp, mgr) = test_manager(SessionConfig::default());
+        let info = create_owned(&mgr, Some(FP_A));
+        // Non-owner cannot terminate (and the record survives).
+        let (result, purged) = mgr.terminate_owned(&info.session_id, Some(FP_B));
+        assert!(matches!(result, Err(SessionError::NotFound(_))));
+        assert!(purged.is_empty());
+        assert!(mgr.get_owned(&info.session_id, Some(FP_A)).0.is_ok());
+        // Owner terminates.
+        let (result, _) = mgr.terminate_owned(&info.session_id, Some(FP_A));
+        assert!(result.is_ok());
+        assert!(matches!(
+            mgr.get_owned(&info.session_id, Some(FP_A)).0,
+            Err(SessionError::NotFound(_))
+        ));
     }
 }

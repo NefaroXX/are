@@ -274,6 +274,7 @@ This architecture is the foundation (Gate 0). Future gates add capability increm
 | 5 | Process execution (structured, no shell) | ✓ Complete (deny-wins + fail-closed allowlist, env sanitization, CSPRNG ids, bounded table/retention, 8 MiB output caps, wait/terminate, advertised process caps) |
 | 6 | Persistent agent sessions | ✓ Complete (CSPRNG sess ids, lazy idle+lifetime expiry, kill-on-expiry, session-bound processes/workdir/env, cascade terminate, owner field reserved for Gate 8) |
 | 7 | Filesystem write operations | ✓ Complete (atomic writes, mkdir/rename/delete, blake3 hashes, optimistic concurrency, renameat2 NOREPLACE on Linux, FilesystemWrite advertised) |
+| 8 | Capability-based authorization | ✓ Complete (cert-fingerprint principals, scoped grants file, session ownership, default DENY, Forbidden errors, permissive only via explicit flag) |
 | 7 | Filesystem write operations | Pending |
 | 8 | Capability-based authorization | Pending |
 | 9 | Agent integration prototype | Pending |

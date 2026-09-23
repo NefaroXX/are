@@ -21,6 +21,11 @@ pub enum CoreError {
     #[error("invalid capability: {0}")]
     InvalidCapability(String),
 
+    /// A grant scope or grants file entry failed validation (bad root,
+    /// malformed principal fingerprint, unknown grant field, ...).
+    #[error("invalid grant: {0}")]
+    InvalidGrant(String),
+
     /// A request failed validation.
     #[error("invalid request: {0}")]
     InvalidRequest(String),

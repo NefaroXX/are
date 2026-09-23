@@ -71,10 +71,18 @@ pub struct GetEnvironmentInfoResponse {
     /// Operations this environment advertises as available.
     ///
     /// This is NOT per-client authorization — all clients see the same set.
-    /// Per-client capability enforcement arrives in Gate 8.
+    /// Each client's EFFECTIVE capabilities are advertised ∩ their grants
+    /// (Gate 8; see `docs/grants.md`). Unknown principals see this set but
+    /// may only call `GetEnvironmentInfo`.
     pub advertised_capabilities: CapabilitySet,
     /// Platform type (Debian, Ubuntu, GenericLinux, etc.).
     pub platform: Platform,
+    /// Fingerprint (`blake3:<hex>`) of the calling client's leaf
+    /// certificate, so `are doctor` shows "who am I" for grants mapping.
+    /// Absent in pre-Gate-8 JSON: defaults to `None` for backward
+    /// compatibility (and for legacy/test paths without an identity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_fingerprint: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -236,13 +244,23 @@ pub enum RpcError {
     /// must create a new session. Distinct from `SessionNotFound` so
     /// clients can report "resume failed: expired" vs "never existed".
     ///
-    /// KNOWN LEAK (documented, Gate 8 must fix): returning `SessionExpired`
-    /// vs `SessionNotFound` lets any client confirm an id was once live
-    /// (an expiry oracle). Gate 8 must return generic `NotFound` to
-    /// non-owners once `SessionInfo.owner` is bound to the client-cert
-    /// identity, and add a cross-client indistinguishability test.
+    /// EXPIRY ORACLE (Gate 8, contained): the `Expired` vs `NotFound`
+    /// distinction is visible ONLY to the session's owner (and to legacy
+    /// ownerless sessions). Non-owners always see `SessionNotFound` — the
+    /// daemon still best-effort kills the expired session's processes, but
+    /// reports the generic miss. See `docs/grants.md` and the
+    /// cross-client indistinguishability test in `gate8_authz.rs`.
     #[error("session expired: {0}")]
     SessionExpired(String),
+
+    /// Authorization denial (Gate 8): the authenticated caller lacks the
+    /// grant for this operation/scope, or (strict mode) holds no grants at
+    /// all. Distinct from `DeniedExecutable` (daemon-wide execution policy,
+    /// principal-independent) so clients can tell "your identity is not
+    /// authorized" from "nobody may run this". Denial messages echo only
+    /// client-supplied relative paths — never canonical host paths.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
 
     /// A bounded table refused the operation (too many sessions or too many
     /// processes). Distinct from `InternalError` so clients can distinguish
@@ -306,10 +324,26 @@ mod tests {
             daemon_version: "0.1.0".into(),
             advertised_capabilities: caps,
             platform: Platform::Debian,
+            caller_fingerprint: Some("blake3:abcd".into()),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: GetEnvironmentInfoResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn get_environment_info_response_legacy_json_without_fingerprint() {
+        // Pre-Gate-8 JSON without `caller_fingerprint` parses with None.
+        let legacy = serde_json::json!({
+            "environment_id": "prod-01",
+            "machine_name": "prod-01",
+            "operating_system": "linux",
+            "daemon_version": "0.1.0",
+            "advertised_capabilities": [],
+            "platform": "debian",
+        });
+        let back: GetEnvironmentInfoResponse = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.caller_fingerprint, None);
     }
 
     #[test]
@@ -338,6 +372,7 @@ mod tests {
                     daemon_version: "0.1.0".into(),
                     advertised_capabilities: caps,
                     platform: Platform::GenericLinux,
+                    caller_fingerprint: None,
                 },
             )),
         };
@@ -360,6 +395,7 @@ mod tests {
         for err in [
             RpcError::NotFound("proc-1".into()),
             RpcError::DeniedExecutable("shutdown".into()),
+            RpcError::Forbidden("filesystem.read denied".into()),
             RpcError::SessionNotFound("sess-9".into()),
             RpcError::SessionExpired("sess-8".into()),
             RpcError::CapacityExceeded("table full".into()),

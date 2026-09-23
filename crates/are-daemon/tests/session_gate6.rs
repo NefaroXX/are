@@ -85,7 +85,7 @@ fn create_session(
     workdir: Option<&str>,
     env: HashMap<String, String>,
 ) -> are_core::SessionInfo {
-    let resp = state.handle(RpcRequest::CreateSession(CreateSessionRequest {
+    let resp = state.handle_legacy_test_only(RpcRequest::CreateSession(CreateSessionRequest {
         environment_id: test_env(),
         working_directory: workdir.map(str::to_string),
         env_vars: env,
@@ -104,7 +104,7 @@ fn exec_in(
     args: &[&str],
     workdir: &str,
 ) -> are_core::ProcessId {
-    let resp = state.handle(RpcRequest::Execute(are_core::ExecuteRequest {
+    let resp = state.handle_legacy_test_only(RpcRequest::Execute(are_core::ExecuteRequest {
         environment_id: test_env(),
         session_id: session.session_id.clone(),
         program: program.into(),
@@ -145,7 +145,7 @@ async fn resume_across_reconnect_keeps_workdir_and_env() {
     drop(session.clone());
     let reconnected = Arc::clone(&state);
 
-    let resp = reconnected.handle(RpcRequest::GetSession(GetSessionRequest {
+    let resp = reconnected.handle_legacy_test_only(RpcRequest::GetSession(GetSessionRequest {
         environment_id: test_env(),
         session_id: session.session_id.clone(),
     }));
@@ -173,21 +173,21 @@ async fn session_survives_interleaved_unrelated_ops() {
         let other = create_session(&state, None, HashMap::new());
         assert_ne!(other.session_id, session.session_id);
     }
-    let listed = state.handle(RpcRequest::ListSessions(ListSessionsRequest {
+    let listed = state.handle_legacy_test_only(RpcRequest::ListSessions(ListSessionsRequest {
         environment_id: test_env(),
     }));
     match listed.result {
         Ok(RpcResponsePayload::ListSessions(list)) => assert_eq!(list.sessions.len(), 6),
         other => panic!("expected ListSessions response, got {other:?}"),
     }
-    let info = state.handle(RpcRequest::GetEnvironmentInfo(
+    let info = state.handle_legacy_test_only(RpcRequest::GetEnvironmentInfo(
         are_core::GetEnvironmentInfoRequest {
             environment_id: test_env(),
         },
     ));
     assert!(info.result.is_ok());
 
-    let resp = state.handle(RpcRequest::GetSession(GetSessionRequest {
+    let resp = state.handle_legacy_test_only(RpcRequest::GetSession(GetSessionRequest {
         environment_id: test_env(),
         session_id: session.session_id.clone(),
     }));
@@ -203,7 +203,7 @@ async fn list_filters_by_environment() {
     let (_tmp, state) = wired_state();
     let session = create_session(&state, None, HashMap::new());
 
-    let resp = state.handle(RpcRequest::ListSessions(ListSessionsRequest {
+    let resp = state.handle_legacy_test_only(RpcRequest::ListSessions(ListSessionsRequest {
         environment_id: test_env(),
     }));
     match resp.result {
@@ -214,7 +214,7 @@ async fn list_filters_by_environment() {
         other => panic!("expected ListSessions response, got {other:?}"),
     }
 
-    let resp = state.handle(RpcRequest::ListSessions(ListSessionsRequest {
+    let resp = state.handle_legacy_test_only(RpcRequest::ListSessions(ListSessionsRequest {
         environment_id: EnvironmentId::new("other-env"),
     }));
     match resp.result {
@@ -226,7 +226,7 @@ async fn list_filters_by_environment() {
 #[tokio::test(flavor = "multi_thread")]
 async fn execute_with_unknown_session_is_session_not_found() {
     let (_tmp, state) = wired_state();
-    let resp = state.handle(RpcRequest::Execute(are_core::ExecuteRequest {
+    let resp = state.handle_legacy_test_only(RpcRequest::Execute(are_core::ExecuteRequest {
         environment_id: test_env(),
         session_id: are_core::SessionId::new("sess-nope"),
         program: "cargo".into(),
@@ -243,7 +243,7 @@ async fn execute_with_unknown_session_is_session_not_found() {
 #[tokio::test(flavor = "multi_thread")]
 async fn get_unknown_session_is_session_not_found() {
     let (_tmp, state) = wired_state();
-    let resp = state.handle(RpcRequest::GetSession(GetSessionRequest {
+    let resp = state.handle_legacy_test_only(RpcRequest::GetSession(GetSessionRequest {
         environment_id: test_env(),
         session_id: are_core::SessionId::new("sess-nope"),
     }));
@@ -256,10 +256,11 @@ async fn get_unknown_session_is_session_not_found() {
 #[tokio::test(flavor = "multi_thread")]
 async fn terminate_unknown_session_is_session_not_found() {
     let (_tmp, state) = wired_state();
-    let resp = state.handle(RpcRequest::TerminateSession(TerminateSessionRequest {
-        environment_id: test_env(),
-        session_id: are_core::SessionId::new("sess-nope"),
-    }));
+    let resp =
+        state.handle_legacy_test_only(RpcRequest::TerminateSession(TerminateSessionRequest {
+            environment_id: test_env(),
+            session_id: are_core::SessionId::new("sess-nope"),
+        }));
     assert!(matches!(
         resp.result,
         Err(are_core::RpcError::SessionNotFound(_))
@@ -274,7 +275,7 @@ async fn idle_expired_session_reports_expired_on_resume() {
     });
     let session = create_session(&state, None, HashMap::new());
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let resp = state.handle(RpcRequest::GetSession(GetSessionRequest {
+    let resp = state.handle_legacy_test_only(RpcRequest::GetSession(GetSessionRequest {
         environment_id: test_env(),
         session_id: session.session_id,
     }));
@@ -294,13 +295,13 @@ async fn max_lifetime_expires_despite_activity() {
     });
     let session = create_session(&state, None, HashMap::new());
     // Activity does not extend the absolute lifetime.
-    let resp = state.handle(RpcRequest::GetSession(GetSessionRequest {
+    let resp = state.handle_legacy_test_only(RpcRequest::GetSession(GetSessionRequest {
         environment_id: test_env(),
         session_id: session.session_id.clone(),
     }));
     assert!(matches!(resp.result, Ok(RpcResponsePayload::GetSession(_))));
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let resp = state.handle(RpcRequest::GetSession(GetSessionRequest {
+    let resp = state.handle_legacy_test_only(RpcRequest::GetSession(GetSessionRequest {
         environment_id: test_env(),
         session_id: session.session_id,
     }));
@@ -328,11 +329,12 @@ async fn process_in_session_a_is_not_found_from_session_b() {
 
     // Same live session B, A's process id: plain NotFound — no leak, no
     // "exists elsewhere" oracle.
-    let resp = state.handle(RpcRequest::ProcessStatus(are_core::ProcessStatusRequest {
-        environment_id: test_env(),
-        session_id: sess_b.session_id,
-        process_id: pid,
-    }));
+    let resp =
+        state.handle_legacy_test_only(RpcRequest::ProcessStatus(are_core::ProcessStatusRequest {
+            environment_id: test_env(),
+            session_id: sess_b.session_id,
+            process_id: pid,
+        }));
     assert!(
         matches!(resp.result, Err(are_core::RpcError::NotFound(_))),
         "cross-session lookup must miss with NotFound, got {:?}",
@@ -355,21 +357,23 @@ async fn terminate_session_cascades_to_its_processes() {
     let pid = exec_in(&state, &session, sleep, &["30"], ".");
 
     // Sanity: running before termination.
-    let resp = state.handle(RpcRequest::ProcessStatus(are_core::ProcessStatusRequest {
-        environment_id: test_env(),
-        session_id: session.session_id.clone(),
-        process_id: pid.clone(),
-    }));
+    let resp =
+        state.handle_legacy_test_only(RpcRequest::ProcessStatus(are_core::ProcessStatusRequest {
+            environment_id: test_env(),
+            session_id: session.session_id.clone(),
+            process_id: pid.clone(),
+        }));
     assert!(matches!(
         resp.result,
         Ok(RpcResponsePayload::ProcessStatus(_))
     ));
 
     // Terminate the session: cascade counts the live kill, then drops the record.
-    let resp = state.handle(RpcRequest::TerminateSession(TerminateSessionRequest {
-        environment_id: test_env(),
-        session_id: session.session_id.clone(),
-    }));
+    let resp =
+        state.handle_legacy_test_only(RpcRequest::TerminateSession(TerminateSessionRequest {
+            environment_id: test_env(),
+            session_id: session.session_id.clone(),
+        }));
     match resp.result {
         Ok(RpcResponsePayload::TerminateSession(done)) => {
             assert_eq!(done.terminated_processes, 1);
@@ -396,7 +400,7 @@ async fn terminate_session_cascades_to_its_processes() {
     );
 
     // Session record is gone: resume reports NotFound.
-    let resp = state.handle(RpcRequest::GetSession(GetSessionRequest {
+    let resp = state.handle_legacy_test_only(RpcRequest::GetSession(GetSessionRequest {
         environment_id: test_env(),
         session_id: session.session_id,
     }));
@@ -421,12 +425,13 @@ async fn empty_workdir_inherits_session_directory() {
 
     let session = create_session(&state, Some("sub"), HashMap::new());
     let pid = exec_in(&state, &session, pwd, &[], "");
-    let resp = state.handle(RpcRequest::WaitProcess(are_core::WaitProcessRequest {
-        environment_id: test_env(),
-        session_id: session.session_id,
-        process_id: pid,
-        timeout_secs: 10,
-    }));
+    let resp =
+        state.handle_legacy_test_only(RpcRequest::WaitProcess(are_core::WaitProcessRequest {
+            environment_id: test_env(),
+            session_id: session.session_id,
+            process_id: pid,
+            timeout_secs: 10,
+        }));
     match resp.result {
         Ok(RpcResponsePayload::WaitProcess(wait)) => {
             assert_eq!(wait.exit_code, Some(0));
@@ -459,12 +464,13 @@ async fn session_env_visible_to_child_with_trusted_path() {
     let pid = exec_in(&state, &session, env, &[], "");
     // Wait needs the session id again (moved above) — fetch it back.
     let session_id = session.session_id.clone();
-    let resp = state.handle(RpcRequest::WaitProcess(are_core::WaitProcessRequest {
-        environment_id: test_env(),
-        session_id,
-        process_id: pid,
-        timeout_secs: 10,
-    }));
+    let resp =
+        state.handle_legacy_test_only(RpcRequest::WaitProcess(are_core::WaitProcessRequest {
+            environment_id: test_env(),
+            session_id,
+            process_id: pid,
+            timeout_secs: 10,
+        }));
     match resp.result {
         Ok(RpcResponsePayload::WaitProcess(wait)) => {
             assert_eq!(wait.exit_code, Some(0));
@@ -688,10 +694,11 @@ async fn respawn_after_terminate_at_cap_succeeds() {
     .to_vec();
     assert!(proc.start(mk_req(), &session).await.is_err());
     // Terminate via the handler (kill-then-remove, live-kill count).
-    let resp = state.handle(RpcRequest::TerminateSession(TerminateSessionRequest {
-        environment_id: test_env(),
-        session_id: session.session_id.clone(),
-    }));
+    let resp =
+        state.handle_legacy_test_only(RpcRequest::TerminateSession(TerminateSessionRequest {
+            environment_id: test_env(),
+            session_id: session.session_id.clone(),
+        }));
     match resp.result {
         Ok(RpcResponsePayload::TerminateSession(done)) => {
             assert_eq!(done.terminated_processes, 2);
@@ -753,7 +760,7 @@ async fn expired_session_touch_kills_live_child_and_reports_expired() {
     let pid = exec_in(&state, &session, sleep, &["30"], ".");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     // Next access expires the session: handler kills the live child first.
-    let resp = state.handle(RpcRequest::GetSession(GetSessionRequest {
+    let resp = state.handle_legacy_test_only(RpcRequest::GetSession(GetSessionRequest {
         environment_id: test_env(),
         session_id: session.session_id.clone(),
     }));
@@ -794,10 +801,11 @@ async fn terminate_expired_session_kills_and_returns_expired() {
     let session = create_session(&state, None, HashMap::new());
     let pid = exec_in(&state, &session, sleep, &["30"], ".");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let resp = state.handle(RpcRequest::TerminateSession(TerminateSessionRequest {
-        environment_id: test_env(),
-        session_id: session.session_id.clone(),
-    }));
+    let resp =
+        state.handle_legacy_test_only(RpcRequest::TerminateSession(TerminateSessionRequest {
+            environment_id: test_env(),
+            session_id: session.session_id.clone(),
+        }));
     match resp.result {
         Err(are_core::RpcError::SessionExpired(msg)) => {
             assert!(
@@ -839,7 +847,7 @@ async fn execute_and_status_with_expired_session_report_expired_without_spawn() 
     let sess_status = create_session(&state, None, HashMap::new());
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let before = state.proc.clone().expect("proc").process_count();
-    let resp = state.handle(RpcRequest::Execute(are_core::ExecuteRequest {
+    let resp = state.handle_legacy_test_only(RpcRequest::Execute(are_core::ExecuteRequest {
         environment_id: test_env(),
         session_id: sess_exec.session_id.clone(),
         program: "cargo".into(),
@@ -852,11 +860,12 @@ async fn execute_and_status_with_expired_session_report_expired_without_spawn() 
         "execute on expired session must report Expired, got {:?}",
         resp.result
     );
-    let resp = state.handle(RpcRequest::ProcessStatus(are_core::ProcessStatusRequest {
-        environment_id: test_env(),
-        session_id: sess_status.session_id,
-        process_id: are_core::ProcessId::new("proc-999999"),
-    }));
+    let resp =
+        state.handle_legacy_test_only(RpcRequest::ProcessStatus(are_core::ProcessStatusRequest {
+            environment_id: test_env(),
+            session_id: sess_status.session_id,
+            process_id: are_core::ProcessId::new("proc-999999"),
+        }));
     assert!(
         matches!(resp.result, Err(are_core::RpcError::SessionExpired(_))),
         "status on expired session must report Expired, got {:?}",
@@ -955,7 +964,7 @@ async fn cross_session_terminal_eviction_shares_global_pool_oldest_first() {
 async fn session_get_and_terminate_enforce_environment_match() {
     let (_tmp, state) = wired_state();
     let session = create_session(&state, None, HashMap::new());
-    let resp = state.handle(RpcRequest::GetSession(GetSessionRequest {
+    let resp = state.handle_legacy_test_only(RpcRequest::GetSession(GetSessionRequest {
         environment_id: EnvironmentId::new("other-env"),
         session_id: session.session_id.clone(),
     }));
@@ -974,7 +983,7 @@ async fn session_capacity_refusal_maps_to_capacity_exceeded() {
         ..SessionConfig::default()
     });
     let _first = create_session(&state, None, HashMap::new());
-    let resp = state.handle(RpcRequest::CreateSession(CreateSessionRequest {
+    let resp = state.handle_legacy_test_only(RpcRequest::CreateSession(CreateSessionRequest {
         environment_id: test_env(),
         working_directory: None,
         env_vars: HashMap::new(),

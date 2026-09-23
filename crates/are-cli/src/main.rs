@@ -105,6 +105,14 @@ enum Commands {
         #[command(subcommand)]
         action: EnvAction,
     },
+
+    /// Print the `blake3:<hex>` fingerprint of a client certificate
+    /// (Gate 8: this is the grants-file principal key for this identity)
+    Fingerprint {
+        /// Path to client certificate PEM
+        #[arg(long)]
+        cert: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -732,6 +740,12 @@ async fn main() {
                     println!("  Machine:     {}", info.machine_name);
                     println!("  Platform:    {}", info.platform);
                     println!("  Version:     {}", info.daemon_version);
+                    // Gate 8: show "who am I" — the fingerprint the
+                    // daemon's grants file maps to this client.
+                    match &info.caller_fingerprint {
+                        Some(fp) => println!("  Caller:      {fp}"),
+                        None => println!("  Caller:      <unknown (pre-Gate-8 daemon)>"),
+                    }
                     println!("  Capabilities:");
                     for cap in info.advertised_capabilities.iter() {
                         println!("    - {cap}");
@@ -1371,6 +1385,29 @@ async fn main() {
             EnvAction::Add { name } => println!("env add: {name} (stub)"),
             EnvAction::Remove { name } => println!("env remove: {name} (stub)"),
         },
+
+        Commands::Fingerprint { cert } => {
+            let data = match std::fs::read(&cert) {
+                Ok(data) => data,
+                Err(e) => {
+                    eprintln!("error: failed to read {}: {e}", cert.display());
+                    std::process::exit(1);
+                }
+            };
+            let mut reader = &data[..];
+            let mut certs = rustls_pemfile::certs(&mut reader);
+            match certs.next() {
+                Some(Ok(der)) => {
+                    // Same derivation as the daemon's caller identity
+                    // (`are-daemon/src/auth.rs`): blake3 over the leaf DER.
+                    println!("blake3:{}", blake3::hash(der.as_ref()).to_hex());
+                }
+                _ => {
+                    eprintln!("error: no certificate found in {}", cert.display());
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }
 

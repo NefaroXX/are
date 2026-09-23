@@ -91,13 +91,15 @@ On Windows, skip symlink creation (see Windows notes below).
 
 ```bash
 # Terminal 1: start daemon with file-based certs
+# (--permissive-authz = dev only; production uses --grants-file, see docs/grants.md)
 ./target/debug/ared listen \
   --port 9000 \
   --environment-id dev-vm \
   --cert certs/server.pem \
   --key certs/server.key \
   --ca certs/ca.pem \
-  --allowed-root /tmp/are-test
+  --allowed-root /tmp/are-test \
+  --permissive-authz
 ```
 
 ### Run the client tests
@@ -335,7 +337,13 @@ pct exec <vmid> -- /usr/local/bin/ared listen \
   --key /etc/are/server.key \
   --ca /etc/are/ca.pem \
   --allowed-root /home/projects \
-  --environment-id dev-container
+  --environment-id dev-container \
+  --permissive-authz
+```
+
+> Gate 8+: replace `--permissive-authz` with `--grants-file /etc/are/grants.json`
+> for least-privilege testing (see `docs/grants.md` + recorded Gate 8 evidence
+> in `docs/remote-test-results.md`).
 ```
 
 `--address 0.0.0.0` is required — the default `127.0.0.1` binds only the

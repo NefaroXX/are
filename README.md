@@ -1,10 +1,10 @@
 # ARE — Agent Remote Environment
 
-> **Status: Gate 7 complete — filesystem writes (atomic write/mkdir/rename/delete, blake3 hashes, optimistic concurrency, no-escape boundaries). STOP for review before Gate 8. Do not use.**
+> **Status: Gate 8 complete — capability-based authorization (cert-fingerprint principals, scoped grants, session ownership, default DENY). STOP for review before Gate 9. Do not use.**
 
 ARE is a secure, agent-oriented remote environment system that lets AI coding agents operate on remote Linux machines as if those machines are their primary execution environment.
 
-This repo is currently **private** while the gated implementation proceeds. See `PLAN.md` for the full 14-gate plan (Gates 0–14, strict STOP gates). Gates 0–7 are complete and awaiting STOP review.
+This repo is currently **private** while the gated implementation proceeds. See `PLAN.md` for the full 14-gate plan (Gates 0–14, strict STOP gates). Gates 0–8 are complete and awaiting STOP review.
 
 ## Working Names
 
@@ -30,7 +30,8 @@ Targets: LXC containers, VMs, remote Linux servers (Debian/Ubuntu/Proxmox LXC), 
 4. Read-Only Filesystem ✓ complete (env-relative, allowed roots, canonicalization + symlink/escape/TOCTOU, file_metadata, 16 MiB cap, advertised read+list)
 5. Process Execution ✓ complete (structured, no shell, deny-wins + fail-closed allowlist, 8 MiB output caps, wait/terminate, CSPRNG ids)
 6. Persistent Agent Sessions ✓ complete (create/resume/list/terminate, idle 3600s + lifetime 86400s expiry, session-bound procs, workdir inherit, session env, kill-on-expiry)
-7. Filesystem Writes ← **we are here** ✓ complete (atomic temp+fsync+rename, mkdir/rename/delete, blake3 content hashes, expected_hash conflicts, renameat2 NOREPLACE on Linux, typed NotFound/Conflict errors)
+7. Filesystem Writes ✓ complete (atomic temp+fsync+rename, mkdir/rename/delete, blake3 content hashes, expected_hash conflicts, renameat2 NOREPLACE on Linux, typed NotFound/Conflict errors)
+8. Capability-Based Authorization ← **we are here** ✓ complete (blake3 cert-fingerprint principals, grants.json scopes, ownership isolation, Forbidden errors, --grants-file/--permissive-authz)
 4. Read-Only Filesystem
 5. Process Execution (structured, no shell)
 6. Persistent Agent Sessions

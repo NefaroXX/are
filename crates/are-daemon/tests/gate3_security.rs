@@ -133,7 +133,7 @@ async fn start_daemon(
                                     let mut writer = io::BufWriter::new(write_half);
                                     let request: RpcRequest =
                                         are_daemon::framing::read_message(&mut reader).await.unwrap();
-                                    let response: RpcResponse = state.handle(request);
+                                    let response: RpcResponse = state.handle_legacy_test_only(request);
                                     let _ = are_daemon::framing::write_message(&mut writer, &response).await;
                                 }
                             });

@@ -17,6 +17,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
 
+use crate::auth::{caller_from_peer_certs, Caller};
 use crate::framing::{self, FramingError, DEFAULT_MAX_PAYLOAD};
 use crate::handler::DaemonState;
 
@@ -62,15 +63,22 @@ impl TlsServer {
             tokio::spawn(async move {
                 match acceptor.accept(tcp_stream).await {
                     Ok(tls_stream) => {
-                        // Log peer certificate presence.
-                        let has_client_cert = tls_stream
-                            .get_ref()
-                            .1
-                            .peer_certificates()
-                            .is_some_and(|certs| !certs.is_empty());
-                        info!("TLS connection from {peer_addr}, client_cert={has_client_cert}");
+                        // Derive the caller principal from the verified leaf
+                        // client certificate (fingerprint-only, no x509
+                        // parsing — see `auth.rs`). Missing peer certs are
+                        // unreachable under mTLS; fail closed if it happens.
+                        let caller: Option<Caller> =
+                            caller_from_peer_certs(tls_stream.get_ref().1.peer_certificates());
+                        let Some(caller) = caller else {
+                            warn!("TLS connection from {peer_addr} has no client certificate; closing");
+                            return;
+                        };
+                        info!(
+                            "TLS connection from {peer_addr}, caller={}",
+                            caller.fingerprint
+                        );
 
-                        if let Err(e) = handle_connection(tls_stream, state).await {
+                        if let Err(e) = handle_connection(tls_stream, state, caller).await {
                             warn!("connection from {peer_addr} handler error: {e}");
                         }
                     }
@@ -86,10 +94,13 @@ impl TlsServer {
 /// Handle a single TLS connection: read one request, write one response.
 ///
 /// Splits the TLS stream into independent read/write halves so we don't
-/// need `Clone` on `TlsStream`.
+/// need `Clone` on `TlsStream`. The handler runs synchronously
+/// (`block_in_place` style, as before — the accept loop stays async and
+/// each connection is its own task; no background threads added).
 async fn handle_connection(
     stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     state: Arc<DaemonState>,
+    caller: Caller,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (read_half, write_half) = io::split(stream);
     let mut reader = io::BufReader::new(read_half);
@@ -100,7 +111,7 @@ async fn handle_connection(
         e
     })?;
 
-    let response: RpcResponse = state.handle(request);
+    let response: RpcResponse = state.handle_as(Some(&caller), request);
 
     write_response(&mut writer, &response).await.map_err(|e| {
         error!("failed to write response: {e}");

@@ -13,7 +13,7 @@
 //! is NOT suitable for production — document in `docs/identity.md`.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use are_core::EnvironmentId;
@@ -101,6 +101,25 @@ enum Commands {
         /// of truth is the daemon config). Default 32.
         #[arg(long, default_value = "32")]
         max_processes_per_session: usize,
+
+        /// Path to a JSON capability-grants file (Gate 8). When present
+        /// the daemon runs STRICT: unknown client fingerprints get
+        /// `GetEnvironmentInfo` only, known ones get exactly their grants
+        /// (see `docs/grants.md` for the schema). A malformed file refuses
+        /// startup. At least one of `--grants-file` or
+        /// `--permissive-authz` MUST be given: with neither, the daemon
+        /// refuses to start.
+        #[arg(long)]
+        grants_file: Option<PathBuf>,
+
+        /// Development only: run WITHOUT a grants table when no
+        /// `--grants-file` is provided — every authenticated client may
+        /// do anything (legacy-permissive, fail-open). NEVER use in
+        /// production. Logs a loud warning at startup. If both flags are
+        /// given, `--grants-file` wins and `--permissive-authz` is
+        /// ignored (with a warning).
+        #[arg(long)]
+        permissive_authz: bool,
     },
 }
 
@@ -131,7 +150,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             session_max_lifetime,
             max_sessions,
             max_processes_per_session,
+            grants_file,
+            permissive_authz,
         } => {
+            // Gate 8 authentication mode: refuse to start unless the
+            // operator explicitly picked STRICT (`--grants-file`) or the
+            // development-only opt-out (`--permissive-authz`). Never
+            // decide silently — fail closed (mirrors the allow/deny-exec
+            // posture: no allow list and no opt-out means no daemon).
+            if let Err(msg) = validate_authz_mode(grants_file.as_deref(), permissive_authz) {
+                eprintln!("error: refusing to start: {msg}");
+                std::process::exit(1);
+            }
+
             let env_id = EnvironmentId::try_new(&environment_id)
                 .map_err(|e| format!("invalid environment_id: {e}"))?;
 
@@ -177,11 +208,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .collect()
                 }),
                 permissive_exec,
+                // Gate 8: a malformed grants file refuses startup (fail
+                // closed — never fall back to permissive on a typo).
+                grants: grants_file.map(
+                    |path| match are_daemon::grants::GrantsTable::load_from_file(&path) {
+                        Ok(table) => {
+                            tracing::info!(
+                                "loaded {} principal(s) from {}",
+                                table.len(),
+                                path.display()
+                            );
+                            if table.is_empty() {
+                                tracing::warn!(
+                                    "grants file has ZERO principals — running STRICT means \
+                                     every client is unknown (GetEnvironmentInfo only)"
+                                );
+                            }
+                            table
+                        }
+                        Err(e) => {
+                            eprintln!("error: refusing to start: {e}");
+                            std::process::exit(1);
+                        }
+                    },
+                ),
             };
 
             if permissive_exec {
                 tracing::warn!(
                     "--permissive-exec: DEVELOPMENT ONLY — any non-denied program may run"
+                );
+            }
+
+            if permissive_authz {
+                tracing::warn!(
+                    "--permissive-authz: DEVELOPMENT ONLY — every authenticated client may do \
+                     anything (legacy-permissive, no grants table)"
+                );
+            }
+
+            if config.grants.is_some() && permissive_authz {
+                tracing::warn!(
+                    "--grants-file and --permissive-authz both given: the grants table wins, \
+                     --permissive-authz is ignored"
                 );
             }
 
@@ -277,4 +346,54 @@ fn generate_ephemeral_certs() -> Result<Arc<rustls::ServerConfig>, Box<dyn std::
 
     let config = tls::build_server_config(vec![server_cert_der], server_key_der, &ca_cert_der)?;
     Ok(config)
+}
+
+/// Gate 8 authentication-mode validation. The daemon must know WHY it is
+/// authenticating before it accepts the first connection: either explicit
+/// STRICT (`Some` grants file) or an explicit development-only opt-out
+/// (`permissive_authz`). Neither → refuse to start. Never an implicit
+/// decision.
+fn validate_authz_mode(grants_file: Option<&Path>, permissive_authz: bool) -> Result<(), String> {
+    if grants_file.is_none() && !permissive_authz {
+        return Err(
+            "neither --grants-file nor --permissive-authz given. Pass --grants-file <path> \
+             to run STRICT, or --permissive-authz to run legacy-permissive (DEVELOPMENT ONLY \
+             — every authenticated client may do anything; do not use in production)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn authz_mode_neither_flag_refuses() {
+        let err = match validate_authz_mode(None, false) {
+            Err(e) => e,
+            Ok(()) => panic!("expected refusal when neither flag is given"),
+        };
+        assert!(err.contains("--grants-file"), "message: {err}");
+        assert!(err.contains("--permissive-authz"), "message: {err}");
+    }
+
+    #[test]
+    fn authz_mode_grants_file_is_strict() {
+        assert!(validate_authz_mode(Some(Path::new("grants.json")), false).is_ok());
+    }
+
+    #[test]
+    fn authz_mode_permissive_is_explicit_opt_in() {
+        assert!(validate_authz_mode(None, true).is_ok());
+    }
+
+    #[test]
+    fn authz_mode_both_flags_is_ok_grants_wins() {
+        assert!(validate_authz_mode(Some(Path::new("grants.json")), true).is_ok());
+    }
 }
