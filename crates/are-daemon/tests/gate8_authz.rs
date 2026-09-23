@@ -117,7 +117,7 @@ fn strict_state_on(tmp: tempfile::TempDir) -> (tempfile::TempDir, DaemonState) {
                     "filesystem_read": [""],
                     "filesystem_write": ["project"],
                     "filesystem_list": [""],
-                    "process_execute": ["echo"],
+                    "process_execute": ["echo", "sleep"],
                     "process_inspect": true,
                     "process_terminate": true
                 }},
