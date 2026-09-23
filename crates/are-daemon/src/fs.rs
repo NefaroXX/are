@@ -358,13 +358,25 @@ impl FilesystemBackend {
                         match std::fs::canonicalize(parent) {
                             Ok(canonical_parent) => {
                                 if canonical_parent.starts_with(root) {
-                                    // Parent is safe. The leaf is just a name (no traversal).
-                                    return Ok(canonical_parent.join(
-                                        joined.file_name().ok_or_else(|| {
-                                            FsError::InvalidPath(format!(
-                                                "no file name in path: {path}"
-                                            ))
-                                        })?,
+                                    // Parent is safe. Now validate the full path (parent + leaf)
+                                    // stays within the root to prevent traversal via the leaf.
+                                    let leaf = joined.file_name().ok_or_else(|| {
+                                        FsError::InvalidPath(format!(
+                                            "no file name in path: {path}"
+                                        ))
+                                    })?;
+                                    let full_path = canonical_parent.join(leaf);
+                                    // Final boundary check: full path must stay within root
+                                    if full_path.starts_with(root) {
+                                        return Ok(full_path);
+                                    }
+                                    tracing::debug!(
+                                        full_path = %full_path.display(),
+                                        root = %root.display(),
+                                        "full path escapes root via leaf"
+                                    );
+                                    return Err(FsError::FilesystemEscape(
+                                        "path escapes allowed boundary".into(),
                                     ));
                                 }
                                 // Parent escaped — this shouldn't happen if the root is valid,
@@ -508,7 +520,20 @@ impl FilesystemBackend {
             match std::fs::canonicalize(&joined_parent) {
                 Ok(canonical_parent) => {
                     if canonical_parent.starts_with(root) {
-                        return Ok(canonical_parent.join(leaf));
+                        // Parent is safe. Now validate the full path (parent + leaf)
+                        // stays within the root to prevent traversal via the leaf.
+                        let full_path = canonical_parent.join(leaf);
+                        if full_path.starts_with(root) {
+                            return Ok(full_path);
+                        }
+                        tracing::debug!(
+                            full_path = %full_path.display(),
+                            root = %root.display(),
+                            "full path escapes root via leaf"
+                        );
+                        return Err(FsError::FilesystemEscape(
+                            "path escapes allowed boundary".into(),
+                        ));
                     }
                     tracing::debug!(
                         canonical_parent = %canonical_parent.display(),
