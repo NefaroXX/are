@@ -1,0 +1,22 @@
+[package]
+name = "are-agent-adapter"
+version = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+description = "Agent adapter for ARE — provides a high-level Environment abstraction backed by are-client"
+
+[dependencies]
+are-core = { workspace = true }
+are-client = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

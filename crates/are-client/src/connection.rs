@@ -47,6 +47,7 @@ pub enum ConnectionError {
 ///
 /// Uses TLS 1.3 mTLS for authentication and length-prefixed JSON for
 /// framing. The client loads certificates from PEM files.
+#[derive(Clone, Debug)]
 pub struct SecureClient {
     tls_config: Arc<rustls::ClientConfig>,
     server_name: ServerName<'static>,

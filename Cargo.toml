@@ -5,6 +5,7 @@ members = [
     "crates/are-client",
     "crates/are-daemon",
     "crates/are-cli",
+    "crates/are-agent-adapter",
 ]
 
 [workspace.package]

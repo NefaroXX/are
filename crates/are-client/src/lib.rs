@@ -18,6 +18,9 @@ pub mod connection;
 pub mod framing;
 pub mod tls;
 
+// Re-export key types for downstream crates
+pub use connection::{SecureClient, ConnectionError};
+
 use are_core::{EnvironmentId, SessionId};
 
 /// Trait for connecting to a remote environment.
