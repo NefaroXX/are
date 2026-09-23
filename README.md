@@ -1,10 +1,10 @@
 # ARE — Agent Remote Environment
 
-> **Status: Gate 8 complete — capability-based authorization (cert-fingerprint principals, scoped grants, session ownership, default DENY). STOP for review before Gate 9. Do not use.**
+> **Status: Gate 9 complete — Agent Integration Prototype (OpenCode-style adapter with Environment trait, session/process handles, 3 verified scenarios). STOP for review before Gate 10. Do not use.**
 
 ARE is a secure, agent-oriented remote environment system that lets AI coding agents operate on remote Linux machines as if those machines are their primary execution environment.
 
-This repo is currently **private** while the gated implementation proceeds. See `PLAN.md` for the full 14-gate plan (Gates 0–14, strict STOP gates). Gates 0–8 are complete and awaiting STOP review.
+This repo is currently **private** while the gated implementation proceeds. See `PLAN.md` for the full 14-gate plan (Gates 0–14, strict STOP gates). Gates 0–9 are complete and awaiting STOP review.
 
 ## Working Names
 
@@ -31,13 +31,8 @@ Targets: LXC containers, VMs, remote Linux servers (Debian/Ubuntu/Proxmox LXC), 
 5. Process Execution ✓ complete (structured, no shell, deny-wins + fail-closed allowlist, 8 MiB output caps, wait/terminate, CSPRNG ids)
 6. Persistent Agent Sessions ✓ complete (create/resume/list/terminate, idle 3600s + lifetime 86400s expiry, session-bound procs, workdir inherit, session env, kill-on-expiry)
 7. Filesystem Writes ✓ complete (atomic temp+fsync+rename, mkdir/rename/delete, blake3 content hashes, expected_hash conflicts, renameat2 NOREPLACE on Linux, typed NotFound/Conflict errors)
-8. Capability-Based Authorization ← **we are here** ✓ complete (blake3 cert-fingerprint principals, grants.json scopes, ownership isolation, Forbidden errors, --grants-file/--permissive-authz)
-4. Read-Only Filesystem
-5. Process Execution (structured, no shell)
-6. Persistent Agent Sessions
-7. Filesystem Writes (atomic)
-8. Capability-Based Authorization
-9. Agent Integration Prototype (OpenCode)
+8. Capability-Based Authorization ✓ complete (blake3 cert-fingerprint principals, grants.json scopes, ownership isolation, Forbidden errors, --grants-file/--permissive-authz)
+9. Agent Integration Prototype ← **we are here** ✓ complete (Environment trait, RemoteEnvironment, SessionHandle, ProcessHandle, 3 OpenCode scenarios verified on 192.168.0.13)
 10. CLI & Usability
 11. Reverse Connection (NAT/CGNAT)
 12. Service Management
