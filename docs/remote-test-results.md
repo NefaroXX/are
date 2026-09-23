@@ -156,3 +156,75 @@ Agents can now create, read, modify, rename, and delete remotely with
 crash-safe atomicity and hash-based conflict detection — while every escape
 shape (traversal, absolute, symlink, nested symlink, cross-boundary rename)
 fails closed. The write surface is ready for capability scoping in Gate 8.
+
+---
+
+# Gate 8 (Capability-Based Authorization) — same target, Gate 8 `ared` release build
+
+**Daemon:** rebuilt on-target with Gate 8 (`grant.rs`, `auth.rs`, `grants.rs`,
+`handler.rs` ownership + grant enforcement), `--grants-file /etc/are/grants.json`,
+`--allow-exec echo,uname,sleep,cat,cargo,ls,false,env`.  
+**Grants file** defines two principals:
+- A (`blake3:07527f8e31ff…ce7a30`) — full read/write/list on entire root, execute `echo,uname,sleep,cat,cargo,ls,false,env`, inspect, terminate.
+- B (`blake3:ce3e4e730fb3…a7f78ad1`) — read/list `logs/` only; no write, no execute.
+- C (`blake3:6e0249dd4e09…816123f1`) — unknown principal (no entry in grants.json).
+
+Remote suite on target: **370 passed, 0 failed** (incl. all 13 Gate 8 adversarial
+tests: two-principal acceptance, unknown principal, hijack, expiry oracle,
+escalation, scope edges, permissive back-compat, 3-cert mTLS wire test).
+
+## Adversarial battery (two-client)
+
+| # | Scenario | Principal(s) | Command / observation | Result |
+|---|----------|--------------|----------------------|--------|
+| 1 | A creates session + process | A | `sess create` → `proc run sleep 30` → `proc status` | ✅ allowed (execute/inspect grants) |
+| 2 | A reads any file | A | `fs read test.txt` (outside logs) | ✅ allowed (fs read "" = whole root) |
+| 3 | A writes any file | A | `fs write new.txt` | ✅ allowed (fs write "" = whole root) |
+| 4 | A renames (write both ends) | A | `fs mv old.txt new.txt` | ✅ allowed (write on src & dst) |
+| 5 | A deletes (folds into write) | A | `fs rm new.txt` | ✅ allowed (delete requires write) |
+| 6 | A lists root | A | `fs list .` | ✅ allowed (fs list "" = whole root) |
+| 7 | B reads logs/ | B | `fs read logs/app.log` | ✅ allowed (fs read `logs/`) |
+| 8 | B lists logs/ | B | `fs list logs` | ✅ allowed (fs list `logs/`) |
+| 9 | B reads outside logs/ | B | `fs read test.txt` | ✅ **Forbidden** `filesystem.read denied for 'test.txt'` |
+| 10 | B writes anywhere | B | `fs write logs/x.txt` | ✅ **Forbidden** `filesystem.write denied for 'logs/x.txt'` (no write grant) |
+| 11 | B executes | B | `proc run echo hi` | ✅ **Forbidden** `process.execute denied for 'echo'` |
+| 12 | B lists root | B | `fs list .` | ✅ **Forbidden** `filesystem.list denied for ''` |
+| 13 | B sees A's session | B | `sess list` | ✅ only B's session visible (ownership filter) |
+| 14 | B touches A's session | B | `sess show <A's sess-id>` | ✅ **NotFound** (collapsed, no oracle) |
+| 15 | C (unknown) env-info | C | `connect` | ✅ **only GetEnvironmentInfo allowed** (includes caller_fingerprint) |
+| 16 | C (unknown) session ops | C | `sess create` | ✅ **Forbidden** `unknown principal: no grants for this client identity (GetEnvironmentInfo only)` |
+| 17 | C (unknown) fs/proc ops | C | any fs/proc | ✅ **Forbidden** (same) |
+| 18 | Permissive back-compat | — | daemon `--permissive-authz` (no grants file) | ✅ legacy path works; ownership still enforced |
+| 19 | Expiry oracle collapse | A+B | A creates short-lived session; B touches after expiry | ✅ B sees `NotFound`; no leaked expiry info |
+| 20 | Hijack cross-owner | A+B | B tries `proc status/kill/wait` on A's proc | ✅ **Forbidden/NotFound** (ownership first, then grants) |
+| 21 | Scope edge: `logs/` vs `logs2/` | B | `read logs/ok` OK, `read logs2/bad` Forbidden | ✅ prefix match, no bleed |
+| 22 | Scope edge: empty root `""` | A | `read any/file` OK | ✅ empty string = entire allowed root |
+| 23 | Scope edge: empty programs | B | `process_execute: []` | ✅ empty array = deny all execute |
+
+## Verified enforcement properties
+
+| Property | Evidence |
+|----------|----------|
+| Principal = `blake3:<64hex>` of leaf DER | `are fingerprint` CLI matches grants key |
+| Default DENY | no grants file → daemon refuses start (requires `--permissive-authz` or `--grants-file`) |
+| Unknown principal | GetEnvironmentInfo only, `caller_fingerprint` field present |
+| Owner = session creator | mismatch → `NotFound`; owner+expired → `Expired`; `ListSessions` filtered |
+| Process exec = policy THEN grants | allowlist deny → `DeniedExecutable` (global); grants deny → `Forbidden` (per-principal) |
+| Rename authz | write required on BOTH source AND destination roots |
+| Delete authz | folds into write (no separate grant) |
+| Cert re-issue = new principal | new fingerprint → no grants unless added to grants.json |
+| No escalation via symlinks | symlink targets resolved, then checked against scope |
+| JSON strict | `deny_unknown_fields`, malformed → `exit(1)` |
+
+## Conclusion
+
+Gate 8 capability-based authorization is **verified on real hardware**:
+- Two principals with different scopes coexist on one daemon without interference.
+- Unknown principals are confined to `GetEnvironmentInfo` (includes their fingerprint for debugging).
+- Session ownership is absolute — non-owners get `NotFound`, not `Expired` (no oracle).
+- Every filesystem operation checks scopes component-wise; `logs/` ≠ `logs2/` ≠ `""`.
+- Process execution is fail-closed at both daemon-wide policy and per-principal grant layer.
+- The `--permissive-authz` escape hatch works for back-compat but logs a loud warning.
+- Remote test suite: **370 tests pass** (incl. all 13 Gate 8 adversarial tests).
+- Ready for Gate 9 (audit logging + metrics).
+
