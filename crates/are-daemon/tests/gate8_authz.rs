@@ -613,7 +613,22 @@ async fn hidden_expiry_still_kills_live_child() {
         Some(fs),
     ));
     let table = GrantsTable::parse_json(&format!(
-        r#"{{"principals": {{"{}": {{"filesystem_read": [""]}}, "{}": {{"filesystem_read": [""]}}}}}}"#,
+        r#"{{
+            "principals": {{
+                "{}": {{
+                    "filesystem_read": [""],
+                    "filesystem_write": ["project"],
+                    "filesystem_list": [""],
+                    "process_execute": ["echo", "sleep"],
+                    "process_inspect": true,
+                    "process_terminate": true
+                }},
+                "{}": {{
+                    "filesystem_read": ["logs"],
+                    "filesystem_list": ["logs"]
+                }}
+            }}
+        }}"#,
         fp_a(),
         fp_b()
     ))
